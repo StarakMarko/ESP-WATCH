@@ -8,6 +8,7 @@
 #include <TimeLib.h>
 #include <time.h>
 #include <esp_sleep.h>
+#include <driver/rtc_io.h> // !!! Додано бібліотеку для керування пінами в сні
 
 // --- Configuration ---
 const char *ssid = "Redmi Note 11";
@@ -20,7 +21,12 @@ const int timezoneOffset = timezone * SECS_PER_MIN * 60;
 #define I2C_SCL 44
 SSD1306Wire display(0x3c, I2C_SDA, I2C_SCL);
 
-#define BUTTON_PIN GPIO_NUM_3
+// --- КНОПКИ ---
+// GPIO 3 - Ліва кнопка (Головна кнопка пробудження)
+// GPIO 0 - Права кнопка
+#define BUTTON_LEFT_PIN GPIO_NUM_3
+#define BUTTON_RIGHT_PIN GPIO_NUM_1
+
 #define BATTERY_PIN GPIO_NUM_8
 
 const float R1 = 61000.0;
@@ -28,7 +34,7 @@ const float R2 = 61000.0;
 const float ADC_MAX_VOLTAGE = 3.3;
 const int ADC_RESOLUTION = 4095;
 const uint64_t FIVE_MINUTES_IN_US = 5 * 60 * 1000000ULL;
-const int DISPLAY_DURATION_S = 5;
+const int INTERACTIVE_TIMEOUT_MS = 5000;
 
 // --- RTC Memory Variables ---
 RTC_DATA_ATTR bool timeSynced = false;
@@ -37,19 +43,21 @@ RTC_DATA_ATTR char lastDirection_char[20];
 RTC_DATA_ATTR int lastDelta_val;
 RTC_DATA_ATTR time_t lastBGSDateTime_val;
 RTC_DATA_ATTR int lastDataAgeMinutes_val;
-RTC_DATA_ATTR bool hasLastData_val = false; // Initialized to false
+RTC_DATA_ATTR bool hasLastData_val = false;
 RTC_DATA_ATTR time_t lastSuccessfulFetchTime = 0;
 RTC_DATA_ATTR float lastBatteryVoltage_val = 0.0;
+RTC_DATA_ATTR int currentScreenIndex = 0;
 
 // --- Global Variables ---
-const char *directarr = "";
-volatile bool buttonPressed = false;
 volatile bool wifiTaskComplete = false;
 volatile bool dataFetchedSuccessfully = false;
 
-void showdata(time_t datetimenow, String BG, int age, float batteryVoltage, String bgs0_direction, int delta);
+// --- Function Prototypes ---
+void drawGlucoseScreen(time_t datetimenow, String BG, int age, float batteryVoltage, String bgs0_direction, int delta);
+void drawClockScreen(time_t datetimenow, float batteryVoltage);
+void updateDisplay();
 
-// --- Arrow Bitmaps (залишено без змін) ---
+// --- Bitmaps (залишаємо ті самі) ---
 const unsigned char ArrowUp[] PROGMEM = {0x80, 0x00, 0xc0, 0x01, 0xe0, 0x03, 0xf0, 0x07, 0xf8, 0x0f, 0xfc, 0x1f, 0xde, 0x3d, 0xcf, 0x79, 0xc7, 0x71, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01};
 const unsigned char ArrowDown[] PROGMEM = {0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc7, 0x71, 0xcf, 0x79, 0xde, 0x3d, 0xfc, 0x1f, 0xf8, 0x0f, 0xf0, 0x07, 0xe0, 0x03, 0xc0, 0x01, 0x80, 0x00};
 const unsigned char ArrowUpS[] PROGMEM = {0x00, 0x00, 0x00, 0x00, 0xf8, 0x3f, 0xf8, 0x3f, 0xf8, 0x3f, 0x00, 0x3f, 0x80, 0x3f, 0xc0, 0x3f, 0xe0, 0x3f, 0xf0, 0x39, 0xf8, 0x38, 0x7c, 0x38, 0x3c, 0x38, 0x1c, 0x00, 0x00, 0x00, 0x00, 0x00};
@@ -57,12 +65,6 @@ const unsigned char ArrowDownS[] PROGMEM = {0x00, 0x00, 0x00, 0x00, 0x1c, 0x00, 
 const unsigned char ArrowSide[] PROGMEM = {0x80, 0x01, 0x80, 0x03, 0x80, 0x07, 0x00, 0x0f, 0x00, 0x1e, 0x00, 0x3c, 0xff, 0x7f, 0xff, 0xff, 0xff, 0x7f, 0x00, 0x3c, 0x00, 0x1e, 0x00, 0x0f, 0x80, 0x07, 0x80, 0x03, 0x80, 0x01};
 const unsigned char ArrowUpD[] PROGMEM = {0x08, 0x10, 0x1c, 0x38, 0x2a, 0x54, 0x49, 0x92, 0x88, 0x11, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10};
 const unsigned char ArrowDownD[] PROGMEM = {0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x88, 0x11, 0x49, 0x92, 0x2a, 0x54, 0x1c, 0x38, 0x08, 0x10};
-
-// --- Button Interrupt Handler ---
-void IRAM_ATTR handleButtonPress()
-{
-  buttonPressed = true;
-}
 
 // --- Battery Voltage Measurement ---
 float getBatteryVoltage()
@@ -78,39 +80,47 @@ void adjustTimezone(time_t &timestamp)
   timestamp += timezoneOffset;
 }
 
-// --- Display Data Helper Function ---
-void displayCurrentData()
+// --- HELPER: Draw currently selected screen ---
+void updateDisplay()
 {
-  if (hasLastData_val)
-  {
-    struct timeval tv_now;
-    gettimeofday(&tv_now, NULL);
-    time_t current_rtc_time = tv_now.tv_sec;
-    setTime(current_rtc_time);
-    int current_data_age = (current_rtc_time - lastBGSDateTime_val) / 60;
-    if (current_data_age < 0)
-      current_data_age = 0;
+  struct timeval tv_now;
+  gettimeofday(&tv_now, NULL);
+  time_t current_rtc_time = tv_now.tv_sec;
+  setTime(current_rtc_time);
 
-    // Виклик вашої функції малювання
-    showdata(current_rtc_time, String(lastBG_char), current_data_age, lastBatteryVoltage_val, String(lastDirection_char), lastDelta_val);
-  }
-  else
+  if (currentScreenIndex == 0)
   {
-    display.clear();
-    display.displayOn();
-    display.setFont(ArialMT_Plain_10);
-    display.setTextAlignment(TEXT_ALIGN_CENTER);
-    display.drawString(64, 26, "No Data Stored.");
-    display.drawString(64, 40, "Wait for Sync...");
-    display.display();
+    // Екран 1: Глюкоза
+    if (hasLastData_val)
+    {
+      int current_data_age = (current_rtc_time - lastBGSDateTime_val) / 60;
+      if (current_data_age < 0)
+        current_data_age = 0;
+      drawGlucoseScreen(current_rtc_time, String(lastBG_char), current_data_age, lastBatteryVoltage_val, String(lastDirection_char), lastDelta_val);
+    }
+    else
+    {
+      display.clear();
+      display.displayOn();
+      display.setFont(ArialMT_Plain_10);
+      display.setTextAlignment(TEXT_ALIGN_CENTER);
+      display.drawString(64, 20, "No Data.");
+      display.drawString(64, 35, "Wait Sync...");
+      display.display();
+    }
+  }
+  else if (currentScreenIndex == 1)
+  {
+    // Екран 2: Великий Годинник
+    drawClockScreen(current_rtc_time, lastBatteryVoltage_val);
   }
 }
 
-// --- Display Data Logic ---
-void showdata(time_t datetimenow, String BG, int age, float batteryVoltage, String bgs0_direction, int delta)
+// --- Screen 1: Glucose ---
+void drawGlucoseScreen(time_t datetimenow, String BG, int age, float batteryVoltage, String bgs0_direction, int delta)
 {
   display.clear();
-  display.displayOn(); // Вмикаємо дисплей
+  display.displayOn();
 
   int hour24 = hour(datetimenow);
   String timeNow = String(hour24) + ":";
@@ -127,36 +137,23 @@ void showdata(time_t datetimenow, String BG, int age, float batteryVoltage, Stri
   display.setFont(ArialMT_Plain_24);
   display.setTextAlignment(TEXT_ALIGN_CENTER);
   display.drawString(45, 19, BG);
-  display.drawString(45 + 1, 19, BG); // Bold effect
+  display.drawString(45 + 1, 19, BG);
 
+  // Стрілки
   if (String(bgs0_direction) == "Flat")
-  {
     display.drawXbm(101, 26, 16, 16, ArrowSide);
-  }
   else if (String(bgs0_direction) == "FortyFiveUp")
-  {
     display.drawXbm(101, 26, 16, 16, ArrowUpS);
-  }
   else if (String(bgs0_direction) == "FortyFiveDown")
-  {
     display.drawXbm(101, 26, 16, 16, ArrowDownS);
-  }
   else if (String(bgs0_direction) == "SingleUp")
-  {
     display.drawXbm(101, 26, 16, 16, ArrowUp);
-  }
   else if (String(bgs0_direction) == "SingleDown")
-  {
     display.drawXbm(101, 26, 16, 16, ArrowDown);
-  }
   else if (String(bgs0_direction) == "DoubleUp")
-  {
     display.drawXbm(101, 26, 16, 16, ArrowUpD);
-  }
   else if (String(bgs0_direction) == "DoubleDown")
-  {
     display.drawXbm(101, 26, 16, 16, ArrowDownD);
-  }
 
   display.setFont(ArialMT_Plain_10);
   display.setTextAlignment(TEXT_ALIGN_LEFT);
@@ -172,6 +169,37 @@ void showdata(time_t datetimenow, String BG, int age, float batteryVoltage, Stri
   display.display();
 }
 
+// --- Screen 2: Big Clock ---
+void drawClockScreen(time_t datetimenow, float batteryVoltage)
+{
+  display.clear();
+  display.displayOn();
+
+  int hour24 = hour(datetimenow);
+  int minVal = minute(datetimenow);
+
+  String timeStr = String(hour24) + ":";
+  if (minVal < 10)
+    timeStr += "0";
+  timeStr += String(minVal);
+
+  display.setFont(ArialMT_Plain_24);
+  display.setTextAlignment(TEXT_ALIGN_CENTER);
+  display.drawString(64, 15, timeStr);
+  display.drawString(65, 15, timeStr);
+
+  display.setFont(ArialMT_Plain_16);
+  String dateStr = String(day(datetimenow)) + "." + String(month(datetimenow)) + "." + String(year(datetimenow));
+  display.drawString(64, 45, dateStr);
+
+  display.setFont(ArialMT_Plain_10);
+  display.setTextAlignment(TEXT_ALIGN_RIGHT);
+  display.drawString(126, 0, String(batteryVoltage, 2) + "V");
+
+  display.drawRect(0, 0, 128, 64);
+  display.display();
+}
+
 // --- Wi-Fi Connection ---
 bool connectToWiFi()
 {
@@ -179,75 +207,49 @@ bool connectToWiFi()
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
   int connectAttempts = 0;
-  // Зменшив кількість спроб для швидшого циклу, якщо немає мережі
   while (WiFi.status() != WL_CONNECTED && connectAttempts < 30)
   {
     Serial.print(".");
     delay(500);
     connectAttempts++;
   }
-  if (WiFi.status() == WL_CONNECTED)
-  {
-    Serial.println("\nConnected to WIFI");
-    return true;
-  }
-  else
-  {
-    Serial.println("\nFailed to connect to WiFi.");
-    return false;
-  }
+  return (WiFi.status() == WL_CONNECTED);
 }
 
-// --- Fetch Readings from xDrip+ ---
+// --- Fetch Readings ---
 bool getreadings()
 {
   WiFiClient client;
-  Serial.print("Connecting to xDrip+ at ");
-  Serial.println(WiFi.gatewayIP());
-
   if (!client.connect(WiFi.gatewayIP(), httpPort))
-  {
-    Serial.println("Connection to xDrip+ failed");
     return false;
-  }
 
   String url = "/pebble";
-  client.print(String("GET ") + url + " HTTP/1.1\r\n" +
-               "Host: " + WiFi.gatewayIP().toString() + "\r\n" +
-               "Connection: close\r\n\r\n");
+  client.print(String("GET ") + url + " HTTP/1.1\r\nHost: " + WiFi.gatewayIP().toString() + "\r\nConnection: close\r\n\r\n");
 
   unsigned long timeout = millis();
   while (client.available() == 0)
   {
     if (millis() - timeout > 5000)
     {
-      Serial.println("Client Timeout !");
       client.stop();
       return false;
     }
   }
 
-  // Пропускаємо заголовки
   while (client.connected())
   {
     String line = client.readStringUntil('\n');
     if (line == "\r")
       break;
   }
-
   String line2 = client.readStringUntil('\n');
-  const size_t bufferSize = 2048;
-  DynamicJsonDocument doc(bufferSize);
+
+  DynamicJsonDocument doc(2048);
   DeserializationError error = deserializeJson(doc, line2);
-
   if (error)
-  {
-    Serial.print("deserializeJson() failed: ");
-    Serial.println(error.f_str());
     return false;
-  }
 
-  // Parsing JSON
+  // Parsing
   String status0_now_str = doc["status"][0]["now"].as<String>();
   status0_now_str = status0_now_str.substring(0, status0_now_str.length() - 3);
   time_t status0_now1 = status0_now_str.toInt();
@@ -261,26 +263,20 @@ bool getreadings()
 
   adjustTimezone(status0_now1);
   adjustTimezone(bgs0_datetime2);
-
   int bgs0_bgdelta = bgs0["bgdelta"];
   int dataAge = (status0_now1 - bgs0_datetime2) / 60;
 
-  // Update RTC Data
+  // Update RTC
   struct timeval tv;
   tv.tv_sec = status0_now1;
   tv.tv_usec = 0;
   settimeofday(&tv, NULL);
   setTime(status0_now1);
   timeSynced = true;
-
   float currentBatteryVoltage = getBatteryVoltage();
 
   strncpy(lastBG_char, bgs0_sgv, sizeof(lastBG_char) - 1);
-  lastBG_char[sizeof(lastBG_char) - 1] = '\0';
-
   strncpy(lastDirection_char, bgs0_direction, sizeof(lastDirection_char) - 1);
-  lastDirection_char[sizeof(lastDirection_char) - 1] = '\0';
-
   lastDelta_val = bgs0_bgdelta;
   lastBGSDateTime_val = bgs0_datetime2;
   lastDataAgeMinutes_val = dataAge;
@@ -291,139 +287,146 @@ bool getreadings()
   return true;
 }
 
-// --- Wi-Fi Task (Runs on Core 0) ---
+// --- Wi-Fi Task ---
 void wifiTask(void *parameter)
 {
-  // Цей код працює паралельно з відображенням на дисплеї
-  bool wifi_connected = connectToWiFi();
-  if (wifi_connected)
+  if (connectToWiFi())
   {
     dataFetchedSuccessfully = getreadings();
     WiFi.disconnect(true);
-    Serial.println("WiFi Disconnected.");
   }
   wifiTaskComplete = true;
   vTaskDelete(NULL);
 }
 
-// --- Setup Function ---
+// --- SETUP ---
 void setup()
 {
   Serial.begin(115200);
 
-  // Ініціалізація дисплея
+  // Налаштовуємо піни
+  pinMode(BUTTON_LEFT_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_RIGHT_PIN, INPUT_PULLUP);
+
   display.init();
   display.flipScreenVertically();
   display.clear();
-  display.displayOff(); // Спочатку вимкнений
-
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
-  esp_sleep_enable_ext0_wakeup(BUTTON_PIN, 0);
-  attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), handleButtonPress, FALLING);
 
   esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
-  uint64_t next_sleep_duration_us = FIVE_MINUTES_IN_US;
 
-  // Оновлюємо час RTC
+  // Час
   struct timeval tv_now;
   gettimeofday(&tv_now, NULL);
   time_t current_rtc_time = tv_now.tv_sec;
+  long time_since_last_fetch = (lastSuccessfulFetchTime == 0) ? LONG_MAX : (current_rtc_time - lastSuccessfulFetchTime);
 
-  // Логіка часу останнього оновлення
-  long time_since_last_actual_fetch_seconds = (lastSuccessfulFetchTime == 0) ? LONG_MAX : (current_rtc_time - lastSuccessfulFetchTime);
-  long five_minutes_in_seconds = FIVE_MINUTES_IN_US / 1000000ULL;
+  bool wokeByTimer = (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER);
+  bool wokeByButton = (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0);
 
-  // Якщо прокинулися від кнопки:
-  if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0)
-  {
-    Serial.println("Wakeup by BUTTON");
-    buttonPressed = true; // Примусово ставимо прапорець
-  }
+  if (wakeup_reason == ESP_SLEEP_WAKEUP_UNDEFINED)
+    wokeByTimer = true;
 
-  // --- ГОЛОВНА ЛОГІКА ---
-  // Якщо натиснута кнопка - показуємо негайно (не чекаючи Wi-Fi)
-  if (buttonPressed)
-  {
-    displayCurrentData();
-    // Тут дисплей буде світитись, поки ми думаємо про Wi-Fi
-  }
+  // --- ЛОГІКА ---
 
-  // Чи потрібен Wi-Fi? (Таймер спрацював АБО дані застаріли)
-  bool needsUpdate = (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER) ||
-                     (time_since_last_actual_fetch_seconds >= five_minutes_in_seconds);
+  // 1. Потрібно оновити дані?
+  bool needsUpdate = wokeByTimer || (time_since_last_fetch >= 300);
 
   if (needsUpdate)
   {
-    Serial.println("Starting WiFi Task on Core 0...");
-    buttonPressed = false; // Скидаємо прапорець, щоб відловити нові натискання
     wifiTaskComplete = false;
     dataFetchedSuccessfully = false;
-
-    // Запускаємо Wi-Fi на ЯДРІ 0 (Core 0), щоб не блокувати ЯДРО 1 (де кнопка і дисплей)
     xTaskCreatePinnedToCore(wifiTask, "WiFiTask", 10000, NULL, 1, NULL, 0);
+  }
 
-    // --- ЦИКЛ ОЧІКУВАННЯ (на ЯДРІ 1) ---
-    unsigned long startTime = millis();
-    // Чекаємо поки Wi-Fi працює (макс 25 сек)
-    while (!wifiTaskComplete && millis() - startTime < 25000)
+  // 2. Інтерактивний режим (Якщо натиснута кнопка)
+  if (wokeByButton)
+  {
+    // !!! ЗМІНА 1: Спочатку показуємо екран, який запам'ятали (з RTC пам'яті)
+    updateDisplay();
+
+    // !!! ЗМІНА 2: Чекаємо, поки користувач ВІДПУСТИТЬ кнопку пробудження.
+    // Якщо цього не зробити, код нижче відразу подумає, що ви хочете переключити екран.
+    while (digitalRead(BUTTON_LEFT_PIN) == LOW)
     {
-      // Якщо користувач натиснув кнопку ПІД ЧАС з'єднання Wi-Fi
-      if (buttonPressed)
+      delay(50);
+      // Можна додати таймаут, щоб не зависло навічно, якщо кнопка залипне
+    }
+    delay(100); // Антибрязкіт після відпускання
+
+    unsigned long lastInputTime = millis();
+
+    // Цикл: поки не пройде 5 секунд бездіяльності
+    while (millis() - lastInputTime < INTERACTIVE_TIMEOUT_MS)
+    {
+      // Читаємо ОБИДВІ кнопки
+      if (digitalRead(BUTTON_LEFT_PIN) == LOW)
       {
-        Serial.println("Button pressed DURING WiFi connection!");
-        displayCurrentData(); // Миттєво малюємо старі дані
-
-        // Тримаємо дисплей увімкненим 5 секунд, АЛЕ не блокуємо логіку надовго
-        unsigned long displayStart = millis();
-        while (millis() - displayStart < DISPLAY_DURATION_S * 1000)
+        if (currentScreenIndex != 0)
         {
-          // Якщо Wi-Fi закінчив роботу поки ми світимо дисплеєм, оновимо дані?
-          if (wifiTaskComplete)
-            break;
-          delay(10);
+          currentScreenIndex = 0; // Перехід на Глюкозу
+          updateDisplay();
         }
-        display.displayOff();
-        buttonPressed = false;
+        lastInputTime = millis();
+        delay(200); // Антибрязкіт
       }
-      delay(10); // Дуже коротка пауза, щоб швидко реагувати
-    }
 
-    // Якщо Wi-Fi завершився успішно і ми ще не показували дані (або хочемо оновити)
-    if (dataFetchedSuccessfully && hasLastData_val)
-    {
-      // Оновлюємо дані на екрані, якщо він був вимкнений (або можна пропустити це)
-      // АЛЕ якщо це був таймер і кнопку НЕ тиснули, екран не треба вмикати?
-      // Зазвичай ми хочемо оновити дані і піти спати.
-    }
+      if (digitalRead(BUTTON_RIGHT_PIN) == LOW)
+      {
+        if (currentScreenIndex != 1)
+        {
+          currentScreenIndex = 1; // Перехід на Годинник
+          updateDisplay();
+        }
+        lastInputTime = millis();
+        delay(200);
+      }
 
-    // Розрахунок сну
-    next_sleep_duration_us = FIVE_MINUTES_IN_US;
+      // Перевірка Wi-Fi (якщо прокинулись кнопкою, але саме час оновити дані)
+      if (needsUpdate && wifiTaskComplete)
+      {
+        if (dataFetchedSuccessfully && currentScreenIndex == 0)
+        {
+          updateDisplay();
+        }
+        needsUpdate = false;
+      }
+      delay(10);
+    }
+    // Час вийшов -> вимикаємо екран
+    display.displayOff();
   }
   else
   {
-    // Якщо оновлення не треба, але ми прокинулись від кнопки -> почекали 5 сек вище -> спимо далі
-    if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0)
+    // Якщо ТАЙМЕР: чекаємо Wi-Fi без екрану
+    unsigned long startWait = millis();
+    while (!wifiTaskComplete && millis() - startWait < 25000)
     {
-      delay(DISPLAY_DURATION_S * 1000); // Дочекатися кінця показу
-      display.displayOff();
+      // Якщо натиснули кнопку ПОКИ чекаємо таймер - просто прокидаємось повністю
+      if (digitalRead(BUTTON_LEFT_PIN) == LOW || digitalRead(BUTTON_RIGHT_PIN) == LOW)
+      {
+        break;
+      }
+      delay(10);
     }
-
-    // Досипаємо решту часу
-    long remaining_sleep_seconds = five_minutes_in_seconds - (time_since_last_actual_fetch_seconds % five_minutes_in_seconds);
-    if (remaining_sleep_seconds < 0)
-      remaining_sleep_seconds = five_minutes_in_seconds;
-    next_sleep_duration_us = (uint64_t)remaining_sleep_seconds * 1000000ULL;
   }
 
-  // --- DEEP SLEEP ---
-  detachInterrupt(digitalPinToInterrupt(BUTTON_PIN));
-  display.displayOff();
-  Serial.printf("Deep Sleep: %llu us\n", next_sleep_duration_us);
-  esp_sleep_enable_timer_wakeup(next_sleep_duration_us);
+  // --- СОН ---
+  long remaining_sleep_seconds = 300 - (time_since_last_fetch % 300);
+  if (remaining_sleep_seconds < 10)
+    remaining_sleep_seconds = 300;
+
+  uint64_t sleep_us = (uint64_t)remaining_sleep_seconds * 1000000ULL;
+
+  esp_sleep_enable_timer_wakeup(sleep_us);
+
+  // Прокидання від лівої кнопки
+  esp_sleep_enable_ext0_wakeup(BUTTON_LEFT_PIN, 0);
+
+  Serial.println("Going to sleep...");
+  Serial.flush();
   esp_deep_sleep_start();
 }
 
 void loop()
 {
-  // Не використовується
 }
