@@ -13,7 +13,7 @@
 const char *ssid = "Redmi Note 11";
 const char *password = "123456781";
 const int httpPort = 17580;
-const int timezone = 3;
+const int timezone = 2;
 const int timezoneOffset = timezone * SECS_PER_MIN * 60;
 
 #define I2C_SDA 43
@@ -113,12 +113,10 @@ void showdata(time_t datetimenow, String BG, int age, float batteryVoltage, Stri
   display.displayOn(); // Вмикаємо дисплей
 
   int hour24 = hour(datetimenow);
-  int hour12 = (hour24 % 12 == 0) ? 12 : hour24 % 12;
-  String ampm = (hour24 >= 12) ? "PM" : "AM";
-  String timeNow = String(hour12) + ":";
+  String timeNow = String(hour24) + ":";
   if (minute(datetimenow) < 10)
     timeNow += "0";
-  timeNow += String(minute(datetimenow)) + " " + ampm;
+  timeNow += String(minute(datetimenow));
 
   display.setFont(ArialMT_Plain_10);
   display.setTextAlignment(TEXT_ALIGN_LEFT);
