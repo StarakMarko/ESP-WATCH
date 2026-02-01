@@ -41,6 +41,7 @@ SSD1306Wire display(0x3c, I2C_SDA, I2C_SCL);
 
 const float R1 = 67000.0;
 const float R2 = 67000.0;
+// Варіант 2: Залишаємо це значення стандартним (3.3V)
 const float ADC_MAX_VOLTAGE = 3.3;
 const int ADC_RESOLUTION = 4095;
 const int INTERACTIVE_TIMEOUT_MS = 6000;
@@ -152,11 +153,18 @@ const unsigned char IconThunder[] PROGMEM = {
     0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
 
 // --- Helper Functions ---
+// --- ЗМІНЕНО ДЛЯ ВАРІАНТУ 2 ---
 float getBatteryVoltage()
 {
+  // Розрахунок коефіцієнту: 4.00 (реальна) / 3.72 (відображена) = ~1.0752
+  float calibration_factor = 1.0752;
+
   int analogValue = analogRead(BATTERY_PIN);
   float voltageAtADC = (float)analogValue * (ADC_MAX_VOLTAGE / ADC_RESOLUTION);
-  return voltageAtADC * (R1 + R2) / R2;
+  float rawVoltage = voltageAtADC * (R1 + R2) / R2;
+
+  // Повертаємо відкаліброване значення
+  return rawVoltage * calibration_factor;
 }
 
 void adjustTimezone(time_t &timestamp)
