@@ -153,7 +153,7 @@ const unsigned char IconThunder[] PROGMEM = {
     0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
 
 // --- Helper Functions ---
-// --- ЗМІНЕНО ДЛЯ ВАРІАНТУ 2 ---
+// --- ЗМІНЕНО ДЛЯ ВАРІАНТУ 2 (КАЛІБРУВАННЯ) ---
 float getBatteryVoltage()
 {
   // Розрахунок коефіцієнту: 4.00 (реальна) / 3.72 (відображена) = ~1.0752
@@ -653,7 +653,8 @@ void setup()
   if (wokeByButton)
   {
     updateDisplay();
-    while (digitalRead(BUTTON_LEFT_PIN) == LOW)
+    // !!! ЗМІНЕНО: Тепер чекаємо відпускання ПРАВОЇ кнопки
+    while (digitalRead(BUTTON_RIGHT_PIN) == LOW)
       delay(50);
     delay(100);
 
@@ -727,7 +728,8 @@ void setup()
   if (remaining < 10)
     remaining = 300;
   esp_sleep_enable_timer_wakeup(remaining * 1000000ULL);
-  esp_sleep_enable_ext0_wakeup(BUTTON_LEFT_PIN, 0);
+  // !!! ЗМІНЕНО: Тепер будить ПРАВА кнопка
+  esp_sleep_enable_ext0_wakeup(BUTTON_RIGHT_PIN, 0);
 
   Serial.println("Sleep.");
   Serial.flush();
