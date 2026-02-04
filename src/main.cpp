@@ -9,7 +9,8 @@
 #include <time.h>
 #include <esp_sleep.h>
 #include <driver/rtc_io.h>
-#include <sntp.h> // Додано для контролю NTP
+#include <sntp.h>
+#include <esp_wifi.h>
 
 // --- Configuration ---
 const char *ssid = "Redmi Note 11";
@@ -28,6 +29,7 @@ const int weatherPort = 80;
 const int timezone = 2; // Ваш часовий пояс (UTC+2)
 const int timezoneOffset = timezone * SECS_PER_MIN * 60;
 
+// Налаштування дисплею
 #define I2C_SDA 44
 #define I2C_SCL 43
 SSD1306Wire display(0x3c, I2C_SDA, I2C_SCL);
@@ -41,32 +43,47 @@ SSD1306Wire display(0x3c, I2C_SDA, I2C_SCL);
 
 const float R1 = 67000.0;
 const float R2 = 67000.0;
-// Варіант 2: Залишаємо це значення стандартним (3.3V)
 const float ADC_MAX_VOLTAGE = 3.3;
 const int ADC_RESOLUTION = 4095;
 const int INTERACTIVE_TIMEOUT_MS = 6000;
 
-// --- RTC Memory Variables ---
-RTC_DATA_ATTR bool timeSynced = false;
-RTC_DATA_ATTR char lastBG_char[10];
-RTC_DATA_ATTR char lastDirection_char[20];
-RTC_DATA_ATTR int lastDelta_val;
-RTC_DATA_ATTR time_t lastBGSDateTime_val;
-RTC_DATA_ATTR int lastDataAgeMinutes_val;
-RTC_DATA_ATTR bool hasLastData_val = false;
-RTC_DATA_ATTR time_t lastSuccessfulFetchTime = 0;
-RTC_DATA_ATTR float lastBatteryVoltage_val = 0.0;
-RTC_DATA_ATTR int currentScreenIndex = 0;
+// --- СТРУКТУРА ДЛЯ ЗБЕРЕЖЕННЯ ДАНИХ ---
+// Ми використовуємо структуру, щоб тримати всі дані разом в RTC пам'яті
+struct PersistentData
+{
+  uint32_t magic; // Магічне число для перевірки цілісності
 
-// Погода RTC
-RTC_DATA_ATTR bool hasWeatherData = false;
-RTC_DATA_ATTR time_t lastWeatherFetchTime = 0;
-RTC_DATA_ATTR int weatherCodes[5];
-RTC_DATA_ATTR float tempMax[5];
-RTC_DATA_ATTR float tempMin[5];
-RTC_DATA_ATTR time_t weatherDates[5];
+  // Глюкоза
+  char lastBG[10];
+  char lastDirection[20];
+  int lastDelta;
+  time_t lastBGSDateTime;
+  bool hasLastData;
 
-// --- Global Variables ---
+  // Погода
+  bool hasWeatherData;
+  time_t lastWeatherFetchTime;
+  int weatherCodes[5];
+  float tempMax[5];
+  float tempMin[5];
+  time_t weatherDates[5];
+
+  // Системні
+  time_t lastSuccessfulFetchTime;
+  float lastBatteryVoltage;
+  int currentScreenIndex;
+  char fetchStatus[20];
+  int failedConnectionCount;
+};
+
+// --- RTC MEMORY ---
+// !!! ВАЖЛИВО: Не присвоюємо значення тут (ніяких = 0), інакше дані зітруться при рестарті!
+RTC_DATA_ATTR PersistentData rtcData;
+
+// Магічне число: якщо воно є в пам'яті, значить це не перший запуск
+#define DATA_MAGIC 0xCAFEBABE
+
+// --- Global Variables (RAM only) ---
 volatile bool wifiTaskComplete = false;
 volatile bool dataFetchedSuccessfully = false;
 volatile bool weatherFetchedSuccessfully = false;
@@ -78,9 +95,10 @@ void drawClockScreen(time_t datetimenow, float batteryVoltage);
 void drawWeatherScreen(time_t datetimenow);
 void updateDisplay();
 String getWeatherDescription(int code);
-bool syncTimeNTP(); // Прототип нової функції
+bool syncTimeNTP();
+void initRTC();
 
-// --- Bitmaps (Залишаємо без змін) ---
+// --- Bitmaps ---
 const unsigned char ArrowUp[] PROGMEM = {0x80, 0x00, 0xc0, 0x01, 0xe0, 0x03, 0xf0, 0x07, 0xf8, 0x0f, 0xfc, 0x1f, 0xde, 0x3d, 0xcf, 0x79, 0xc7, 0x71, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01};
 const unsigned char ArrowDown[] PROGMEM = {0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc7, 0x71, 0xcf, 0x79, 0xde, 0x3d, 0xfc, 0x1f, 0xf8, 0x0f, 0xf0, 0x07, 0xe0, 0x03, 0xc0, 0x01, 0x80, 0x00};
 const unsigned char ArrowUpS[] PROGMEM = {0x00, 0x00, 0x00, 0x00, 0xf8, 0x3f, 0xf8, 0x3f, 0xf8, 0x3f, 0x00, 0x3f, 0x80, 0x3f, 0xc0, 0x3f, 0xe0, 0x3f, 0xf0, 0x39, 0xf8, 0x38, 0x7c, 0x38, 0x3c, 0x38, 0x1c, 0x00, 0x00, 0x00, 0x00, 0x00};
@@ -89,81 +107,20 @@ const unsigned char ArrowSide[] PROGMEM = {0x80, 0x01, 0x80, 0x03, 0x80, 0x07, 0
 const unsigned char ArrowUpD[] PROGMEM = {0x08, 0x10, 0x1c, 0x38, 0x2a, 0x54, 0x49, 0x92, 0x88, 0x11, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10};
 const unsigned char ArrowDownD[] PROGMEM = {0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x88, 0x11, 0x49, 0x92, 0x2a, 0x54, 0x1c, 0x38, 0x08, 0x10};
 
-// --- Weather Icons (32x32) ---
-const unsigned char IconSun[] PROGMEM = {
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x0f, 0x00, 0x00, 0xfc, 0x3f, 0x00,
-    0x00, 0xfe, 0x7f, 0x00, 0x80, 0xff, 0xff, 0x01, 0x80, 0xff, 0xff, 0x01, 0xc0, 0xff, 0xff, 0x03,
-    0xe0, 0xff, 0xff, 0x07, 0xe0, 0xff, 0xff, 0x07, 0xf0, 0xff, 0xff, 0x0f, 0xf0, 0xff, 0xff, 0x0f,
-    0xf0, 0xff, 0xff, 0x0f, 0xf0, 0xff, 0xff, 0x0f, 0xf0, 0xff, 0xff, 0x0f, 0xf0, 0xff, 0xff, 0x0f,
-    0xf0, 0xff, 0xff, 0x0f, 0xf0, 0xff, 0xff, 0x0f, 0xe0, 0xff, 0xff, 0x07, 0xe0, 0xff, 0xff, 0x07,
-    0xc0, 0xff, 0xff, 0x03, 0x80, 0xff, 0xff, 0x01, 0x80, 0xff, 0xff, 0x01, 0x00, 0xfe, 0x7f, 0x00,
-    0x00, 0xfc, 0x3f, 0x00, 0x00, 0xf0, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-
-const unsigned char IconCloud[] PROGMEM = {
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0xF0, 0x03, 0x00, 0x00, 0xFC, 0x0F, 0x00, 0x00, 0x0E, 0x1C, 0x00,
-    0x00, 0x02, 0x30, 0x00, 0x00, 0x03, 0x60, 0x00, 0x80, 0x01, 0x40, 0x00,
-    0xC0, 0x00, 0xC0, 0x00, 0x60, 0x00, 0x80, 0x01, 0x20, 0x00, 0x00, 0x01,
-    0x30, 0x00, 0x00, 0x03, 0x30, 0x00, 0x00, 0x02, 0x30, 0x00, 0x00, 0x02,
-    0x30, 0x00, 0x00, 0x02, 0x30, 0x00, 0x00, 0x02, 0x20, 0x00, 0x00, 0x01,
-    0x60, 0x00, 0x80, 0x01, 0xC0, 0x00, 0xC0, 0x00, 0x80, 0xFF, 0x7F, 0x00,
-    0x00, 0xFF, 0x3F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-
-const unsigned char IconRain[] PROGMEM = {
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x03, 0x00,
-    0x00, 0xFC, 0x0F, 0x00, 0x00, 0x0E, 0x1C, 0x00, 0x00, 0x02, 0x30, 0x00,
-    0x00, 0x03, 0x60, 0x00, 0x80, 0x01, 0x40, 0x00, 0xC0, 0x00, 0xC0, 0x00,
-    0x60, 0x00, 0x80, 0x01, 0x20, 0x00, 0x00, 0x01, 0x30, 0x00, 0x00, 0x03,
-    0x30, 0x00, 0x00, 0x02, 0x30, 0x00, 0x00, 0x02, 0x30, 0x00, 0x00, 0x02,
-    0x30, 0x00, 0x00, 0x02, 0x20, 0x00, 0x00, 0x01, 0x60, 0x00, 0x80, 0x01,
-    0xC0, 0x00, 0xC0, 0x00, 0x80, 0xFF, 0x7F, 0x00, 0x00, 0xFF, 0x3F, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x01, 0x00, 0x00, 0x80, 0x01, 0x00,
-    0x20, 0x40, 0x08, 0x00, 0x20, 0x40, 0x08, 0x00, 0x10, 0x20, 0x04, 0x00,
-    0x10, 0x20, 0x04, 0x00, 0x08, 0x10, 0x02, 0x00, 0x08, 0x10, 0x02, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-
-const unsigned char IconSnow[] PROGMEM = {
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x03, 0x00,
-    0x00, 0xFC, 0x0F, 0x00, 0x00, 0x0E, 0x1C, 0x00, 0x00, 0x02, 0x30, 0x00,
-    0x00, 0x03, 0x60, 0x00, 0x80, 0x01, 0x40, 0x00, 0xC0, 0x00, 0xC0, 0x00,
-    0x60, 0x00, 0x80, 0x01, 0x20, 0x00, 0x00, 0x01, 0x30, 0x00, 0x00, 0x03,
-    0x30, 0x00, 0x00, 0x02, 0x30, 0x00, 0x00, 0x02, 0x30, 0x00, 0x00, 0x02,
-    0x30, 0x00, 0x00, 0x02, 0x20, 0x00, 0x00, 0x01, 0x60, 0x00, 0x80, 0x01,
-    0xC0, 0x00, 0xC0, 0x00, 0x80, 0xFF, 0x7F, 0x00, 0x00, 0xFF, 0x3F, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x44, 0x11, 0x00, 0x00, 0x28, 0x0A, 0x00,
-    0x00, 0x10, 0x04, 0x00, 0x00, 0x28, 0x0A, 0x00, 0x00, 0x44, 0x11, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-
-const unsigned char IconThunder[] PROGMEM = {
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x03, 0x00,
-    0x00, 0xFC, 0x0F, 0x00, 0x00, 0x0E, 0x1C, 0x00, 0x00, 0x02, 0x30, 0x00,
-    0x00, 0x03, 0x60, 0x00, 0x80, 0x01, 0x40, 0x00, 0xC0, 0x00, 0xC0, 0x00,
-    0x60, 0x00, 0x80, 0x01, 0x20, 0x00, 0x00, 0x01, 0x30, 0x00, 0x00, 0x03,
-    0x30, 0x00, 0x00, 0x02, 0x30, 0x00, 0x00, 0x02, 0x30, 0x00, 0x00, 0x02,
-    0x30, 0x00, 0x00, 0x02, 0x20, 0x00, 0x00, 0x01, 0x60, 0x00, 0x80, 0x01,
-    0xC0, 0x00, 0xC0, 0x00, 0x80, 0xFF, 0x7F, 0x00, 0x00, 0xFF, 0x3F, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x30, 0x00, 0x00,
-    0x00, 0x60, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0xFF, 0x01, 0x00,
-    0x00, 0x1E, 0x00, 0x00, 0x00, 0x1C, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00,
-    0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+// --- Weather Icons ---
+const unsigned char IconSun[] PROGMEM = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x0f, 0x00, 0x00, 0xfc, 0x3f, 0x00, 0x00, 0xfe, 0x7f, 0x00, 0x80, 0xff, 0xff, 0x01, 0x80, 0xff, 0xff, 0x01, 0xc0, 0xff, 0xff, 0x03, 0xe0, 0xff, 0xff, 0x07, 0xe0, 0xff, 0xff, 0x07, 0xf0, 0xff, 0xff, 0x0f, 0xf0, 0xff, 0xff, 0x0f, 0xf0, 0xff, 0xff, 0x0f, 0xf0, 0xff, 0xff, 0x0f, 0xf0, 0xff, 0xff, 0x0f, 0xf0, 0xff, 0xff, 0x0f, 0xe0, 0xff, 0xff, 0x07, 0xe0, 0xff, 0xff, 0x07, 0xc0, 0xff, 0xff, 0x03, 0x80, 0xff, 0xff, 0x01, 0x80, 0xff, 0xff, 0x01, 0x00, 0xfe, 0x7f, 0x00, 0x00, 0xfc, 0x3f, 0x00, 0x00, 0xf0, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+const unsigned char IconCloud[] PROGMEM = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x03, 0x00, 0x00, 0xFC, 0x0F, 0x00, 0x00, 0x0E, 0x1C, 0x00, 0x00, 0x02, 0x30, 0x00, 0x00, 0x03, 0x60, 0x00, 0x80, 0x01, 0x40, 0x00, 0xC0, 0x00, 0xC0, 0x00, 0x60, 0x00, 0x80, 0x01, 0x20, 0x00, 0x00, 0x01, 0x30, 0x00, 0x00, 0x03, 0x30, 0x00, 0x00, 0x02, 0x30, 0x00, 0x00, 0x02, 0x30, 0x00, 0x00, 0x02, 0x30, 0x00, 0x00, 0x02, 0x20, 0x00, 0x00, 0x01, 0x60, 0x00, 0x80, 0x01, 0xC0, 0x00, 0xC0, 0x00, 0x80, 0xFF, 0x7F, 0x00, 0x00, 0xFF, 0x3F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+const unsigned char IconRain[] PROGMEM = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x03, 0x00, 0x00, 0xFC, 0x0F, 0x00, 0x00, 0x0E, 0x1C, 0x00, 0x00, 0x02, 0x30, 0x00, 0x00, 0x03, 0x60, 0x00, 0x80, 0x01, 0x40, 0x00, 0xC0, 0x00, 0xC0, 0x00, 0x60, 0x00, 0x80, 0x01, 0x20, 0x00, 0x00, 0x01, 0x30, 0x00, 0x00, 0x03, 0x30, 0x00, 0x00, 0x02, 0x30, 0x00, 0x00, 0x02, 0x30, 0x00, 0x00, 0x02, 0x30, 0x00, 0x00, 0x02, 0x20, 0x00, 0x00, 0x01, 0x60, 0x00, 0x80, 0x01, 0xC0, 0x00, 0xC0, 0x00, 0x80, 0xFF, 0x7F, 0x00, 0x00, 0xFF, 0x3F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x01, 0x00, 0x00, 0x80, 0x01, 0x00, 0x20, 0x40, 0x08, 0x00, 0x20, 0x40, 0x08, 0x00, 0x10, 0x20, 0x04, 0x00, 0x10, 0x20, 0x04, 0x00, 0x08, 0x10, 0x02, 0x00, 0x08, 0x10, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+const unsigned char IconSnow[] PROGMEM = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x03, 0x00, 0x00, 0xFC, 0x0F, 0x00, 0x00, 0x0E, 0x1C, 0x00, 0x00, 0x02, 0x30, 0x00, 0x00, 0x03, 0x60, 0x00, 0x80, 0x01, 0x40, 0x00, 0xC0, 0x00, 0xC0, 0x00, 0x60, 0x00, 0x80, 0x01, 0x20, 0x00, 0x00, 0x01, 0x30, 0x00, 0x00, 0x03, 0x30, 0x00, 0x00, 0x02, 0x30, 0x00, 0x00, 0x02, 0x30, 0x00, 0x00, 0x02, 0x30, 0x00, 0x00, 0x02, 0x20, 0x00, 0x00, 0x01, 0x60, 0x00, 0x80, 0x01, 0xC0, 0x00, 0xC0, 0x00, 0x80, 0xFF, 0x7F, 0x00, 0x00, 0xFF, 0x3F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x44, 0x11, 0x00, 0x00, 0x28, 0x0A, 0x00, 0x00, 0x10, 0x04, 0x00, 0x00, 0x28, 0x0A, 0x00, 0x00, 0x44, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+const unsigned char IconThunder[] PROGMEM = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x03, 0x00, 0x00, 0xFC, 0x0F, 0x00, 0x00, 0x0E, 0x1C, 0x00, 0x00, 0x02, 0x30, 0x00, 0x00, 0x03, 0x60, 0x00, 0x80, 0x01, 0x40, 0x00, 0xC0, 0x00, 0xC0, 0x00, 0x60, 0x00, 0x80, 0x01, 0x20, 0x00, 0x00, 0x01, 0x30, 0x00, 0x00, 0x03, 0x30, 0x00, 0x00, 0x02, 0x30, 0x00, 0x00, 0x02, 0x30, 0x00, 0x00, 0x02, 0x30, 0x00, 0x00, 0x02, 0x20, 0x00, 0x00, 0x01, 0x60, 0x00, 0x80, 0x01, 0xC0, 0x00, 0xC0, 0x00, 0x80, 0xFF, 0x7F, 0x00, 0x00, 0xFF, 0x3F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x30, 0x00, 0x00, 0x00, 0x60, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0xFF, 0x01, 0x00, 0x00, 0x1E, 0x00, 0x00, 0x00, 0x1C, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
 
 // --- Helper Functions ---
-// --- ЗМІНЕНО ДЛЯ ВАРІАНТУ 2 (КАЛІБРУВАННЯ) ---
 float getBatteryVoltage()
 {
-  // Розрахунок коефіцієнту: 4.00 (реальна) / 3.72 (відображена) = ~1.0752
   float calibration_factor = 1.0752;
-
   int analogValue = analogRead(BATTERY_PIN);
   float voltageAtADC = (float)analogValue * (ADC_MAX_VOLTAGE / ADC_RESOLUTION);
   float rawVoltage = voltageAtADC * (R1 + R2) / R2;
-
-  // Повертаємо відкаліброване значення
   return rawVoltage * calibration_factor;
 }
 
@@ -180,14 +137,15 @@ void updateDisplay()
   time_t current_rtc_time = tv_now.tv_sec;
   setTime(current_rtc_time);
 
-  if (currentScreenIndex == 0)
+  if (rtcData.currentScreenIndex == 0)
   { // SCREEN 0: GLUCOSE
-    if (hasLastData_val)
+    if (rtcData.hasLastData)
     {
-      int current_data_age = (current_rtc_time - lastBGSDateTime_val) / 60;
+      int current_data_age = (current_rtc_time - rtcData.lastBGSDateTime) / 60;
       if (current_data_age < 0)
         current_data_age = 0;
-      drawGlucoseScreen(current_rtc_time, String(lastBG_char), current_data_age, lastBatteryVoltage_val, String(lastDirection_char), lastDelta_val);
+
+      drawGlucoseScreen(current_rtc_time, String(rtcData.lastBG), current_data_age, rtcData.lastBatteryVoltage, String(rtcData.lastDirection), rtcData.lastDelta);
     }
     else
     {
@@ -195,15 +153,20 @@ void updateDisplay()
       display.displayOn();
       display.setFont(ArialMT_Plain_16);
       display.setTextAlignment(TEXT_ALIGN_CENTER);
-      display.drawString(64, 25, "No Glucose Data");
+      display.drawString(64, 25, "Waiting Data...");
+      if (strlen(rtcData.fetchStatus) > 0)
+      {
+        display.setFont(ArialMT_Plain_10);
+        display.drawString(64, 53, String(rtcData.fetchStatus));
+      }
       display.display();
     }
   }
-  else if (currentScreenIndex == 1)
+  else if (rtcData.currentScreenIndex == 1)
   { // SCREEN 1: CLOCK
-    drawClockScreen(current_rtc_time, lastBatteryVoltage_val);
+    drawClockScreen(current_rtc_time, rtcData.lastBatteryVoltage);
   }
-  else if (currentScreenIndex == 2)
+  else if (rtcData.currentScreenIndex == 2)
   { // SCREEN 2: WEATHER
     drawWeatherScreen(current_rtc_time);
   }
@@ -221,7 +184,9 @@ void drawGlucoseScreen(time_t datetimenow, String BG, int age, float batteryVolt
   display.setTextAlignment(TEXT_ALIGN_LEFT);
   display.drawString(2, 3, timeNow);
   display.setTextAlignment(TEXT_ALIGN_RIGHT);
-  display.drawString(126, 3, String(age) + " min ago");
+  // Якщо вік даних > 60 хв, додамо знак оклику
+  String ageStr = (age > 60) ? String(age) + "m !" : String(age) + " min";
+  display.drawString(126, 3, ageStr);
 
   display.setFont(ArialMT_Plain_24);
   display.setTextAlignment(TEXT_ALIGN_CENTER);
@@ -249,6 +214,13 @@ void drawGlucoseScreen(time_t datetimenow, String BG, int age, float batteryVolt
   display.setTextAlignment(TEXT_ALIGN_RIGHT);
   String bgdelta = (delta > 0) ? "+" + String(delta) : String(delta);
   display.drawString(126, 50, bgdelta + " mg/dl ");
+
+  // --- ERROR STATUS DISPLAY ---
+  if (strlen(rtcData.fetchStatus) > 0)
+  {
+    display.setTextAlignment(TEXT_ALIGN_CENTER);
+    display.drawString(64, 53, String(rtcData.fetchStatus));
+  }
 
   display.drawRect(0, 0, 128, 64);
   display.drawRect(0, 17, 128, 33);
@@ -285,12 +257,15 @@ void drawWeatherScreen(time_t datetimenow)
   display.clear();
   display.displayOn();
 
-  if (!hasWeatherData)
+  if (!rtcData.hasWeatherData)
   {
     display.setFont(ArialMT_Plain_10);
     display.setTextAlignment(TEXT_ALIGN_CENTER);
-    display.drawString(64, 25, "Data Fetching...");
-    display.drawString(64, 38, "Or Failed.");
+    display.drawString(64, 25, "Waiting Weather...");
+    if (strlen(rtcData.fetchStatus) > 0)
+    {
+      display.drawString(64, 38, String(rtcData.fetchStatus));
+    }
     display.display();
     return;
   }
@@ -300,7 +275,7 @@ void drawWeatherScreen(time_t datetimenow)
   if (weatherDayOffset > 4)
     weatherDayOffset = 4;
 
-  time_t forecastTime = weatherDates[weatherDayOffset];
+  time_t forecastTime = rtcData.weatherDates[weatherDayOffset];
   String dateStr = String(day(forecastTime)) + "/" + String(month(forecastTime));
   if (weatherDayOffset == 0)
     dateStr = "Today";
@@ -312,47 +287,30 @@ void drawWeatherScreen(time_t datetimenow)
   display.setTextAlignment(TEXT_ALIGN_CENTER);
   display.drawString(64, 0, "Lviv: " + dateStr);
 
-  // Температура (Трохи вище, щоб влізла іконка)
+  // Температура
   display.setFont(ArialMT_Plain_24);
-  String tempStr = String((int)tempMax[weatherDayOffset]) + " / " + String((int)tempMin[weatherDayOffset]);
+  String tempStr = String((int)rtcData.tempMax[weatherDayOffset]) + " / " + String((int)rtcData.tempMin[weatherDayOffset]);
   display.drawString(64, 12, tempStr);
 
   // --- ЛОГІКА ВИБОРУ ІКОНКИ ---
-  int code = weatherCodes[weatherDayOffset];
-  const unsigned char *weatherIcon = IconCloud; // Іконка за замовчуванням
+  int code = rtcData.weatherCodes[weatherDayOffset];
+  const unsigned char *weatherIcon = IconCloud;
 
-  // Вибір іконки за кодом Open-Meteo
   if (code == 0)
-  {
     weatherIcon = IconSun;
-  }
   else if (code >= 1 && code <= 3)
-  {
     weatherIcon = IconCloud;
-  }
   else if (code == 45 || code == 48)
-  {
-    weatherIcon = IconCloud; // Туман як хмара
-  }
+    weatherIcon = IconCloud;
   else if ((code >= 51 && code <= 67) || (code >= 80 && code <= 82))
-  {
     weatherIcon = IconRain;
-  }
   else if (code >= 71 && code <= 77)
-  {
     weatherIcon = IconSnow;
-  }
   else if (code >= 95)
-  {
     weatherIcon = IconThunder;
-  }
 
-  // Малюємо іконку по центру знизу (64 - 16 = 48)
-  // X = 48 (центр екрану 64 мінус половина ширини іконки 16)
-  // Y = 36 (знизу під температурою)
   display.drawXbm(48, 36, 32, 32, weatherIcon);
 
-  // Стрілки навігації
   display.setFont(ArialMT_Plain_10);
   if (weatherDayOffset > 0)
     display.drawString(10, 25, "<");
@@ -363,157 +321,233 @@ void drawWeatherScreen(time_t datetimenow)
   display.display();
 }
 
-String getWeatherDescription(int code)
+// --- INIT RTC (При старті перевіряємо, чи є дані) ---
+void initRTC()
 {
-  if (code == 0)
-    return "Clear";
-  if (code >= 1 && code <= 3)
-    return "Cloudy";
-  if (code == 45 || code == 48)
-    return "Fog";
-  if (code >= 51 && code <= 55)
-    return "Drizzle";
-  if (code >= 61 && code <= 67)
-    return "Rain";
-  if (code >= 71 && code <= 77)
-    return "Snow";
-  if (code >= 80 && code <= 82)
-    return "Showers";
-  if (code >= 95)
-    return "Thunder";
-  return String(code);
+  // Якщо магічне число не збігається, значить пам'ять порожня (після виймання батарейки)
+  if (rtcData.magic != DATA_MAGIC)
+  {
+    Serial.println("Cold Boot: Clearning memory...");
+
+    // Очищаємо всю структуру нулями
+    memset(&rtcData, 0, sizeof(PersistentData));
+
+    // Встановлюємо магічне число
+    rtcData.magic = DATA_MAGIC;
+    rtcData.currentScreenIndex = 0;
+  }
+  else
+  {
+    Serial.println("Warm Boot: Data restored!");
+  }
 }
 
-// --- NETWORK ---
+// --- NETWORK CONNECTION ---
 bool connectToWiFi()
 {
-  Serial.print("Connecting to WIFI");
+  Serial.print("Connecting to WIFI... ");
+  strcpy(rtcData.fetchStatus, "WiFi Init...");
+
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  delay(200);
+
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  WiFi.persistent(false);
+
   WiFi.begin(ssid, password);
+
   int connectAttempts = 0;
-  while (WiFi.status() != WL_CONNECTED && connectAttempts < 30)
+  while (WiFi.status() != WL_CONNECTED && connectAttempts < 24)
   {
     Serial.print(".");
     delay(500);
     connectAttempts++;
   }
-  return (WiFi.status() == WL_CONNECTED);
+
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    Serial.println("\nConnected! IP: " + WiFi.localIP().toString());
+    strcpy(rtcData.fetchStatus, "WiFi OK");
+    rtcData.failedConnectionCount = 0;
+    return true;
+  }
+  else
+  {
+    Serial.println("\nFailed to connect.");
+    strcpy(rtcData.fetchStatus, "WiFi Fail");
+
+    rtcData.failedConnectionCount++;
+    if (rtcData.failedConnectionCount < 3)
+    {
+      Serial.println("Restarting ESP to fix WiFi...");
+      ESP.restart(); // Тепер це безпечно, бо дані збережені!
+    }
+    else
+    {
+      rtcData.failedConnectionCount = 0;
+    }
+
+    return false;
+  }
 }
 
+// --- GET READINGS ---
 bool getreadings()
 {
   WiFiClient client;
-  if (!client.connect(WiFi.gatewayIP(), httpPort))
-    return false;
+  client.setTimeout(8000);
 
-  client.print(String("GET /pebble HTTP/1.1\r\nHost: ") + WiFi.gatewayIP().toString() + "\r\nConnection: close\r\n\r\n");
+  strcpy(rtcData.fetchStatus, "Conn NS...");
+  Serial.print("Connecting to Nightscout (" + WiFi.gatewayIP().toString() + ")... ");
+
+  if (!client.connect(WiFi.gatewayIP(), httpPort))
+  {
+    Serial.println("Connection failed");
+    strcpy(rtcData.fetchStatus, "NS Conn Err");
+    client.stop();
+    return false;
+  }
+  Serial.println("Connected!");
+
+  client.print(String("GET /pebble HTTP/1.0\r\nHost: ") + WiFi.gatewayIP().toString() + "\r\nConnection: close\r\n\r\n");
 
   unsigned long timeout = millis();
   while (client.available() == 0)
   {
-    if (millis() - timeout > 5000)
+    if (millis() - timeout > 8000)
     {
+      Serial.println("Client Timeout (No Data)!");
+      strcpy(rtcData.fetchStatus, "NS Timeout");
       client.stop();
       return false;
     }
+    delay(10);
   }
 
-  // Skip headers
-  while (client.connected())
+  if (!client.find("\r\n\r\n"))
   {
-    String line = client.readStringUntil('\n');
-    if (line == "\r")
-      break;
+    Serial.println("Invalid response (no headers)");
+    strcpy(rtcData.fetchStatus, "Inv Header");
+    client.stop();
+    return false;
   }
 
-  // Parse Glucose JSON
-  DynamicJsonDocument doc(2048);
-  DeserializationError error = deserializeJson(doc, client); // Read directly from stream
+  DynamicJsonDocument doc(3000);
+  DeserializationError error = deserializeJson(doc, client);
+
   if (error)
+  {
+    Serial.print("JSON Error: ");
+    Serial.println(error.f_str());
+    strcpy(rtcData.fetchStatus, "JSON Err");
+    client.stop();
     return false;
+  }
+
+  if (!doc.containsKey("status") || !doc.containsKey("bgs"))
+  {
+    Serial.println("JSON Format Error: Missing keys");
+    strcpy(rtcData.fetchStatus, "Bad Data");
+    client.stop();
+    return false;
+  }
 
   String status0_now_str = doc["status"][0]["now"].as<String>();
-  status0_now_str = status0_now_str.substring(0, status0_now_str.length() - 3);
+  if (status0_now_str.length() > 3)
+  {
+    status0_now_str = status0_now_str.substring(0, status0_now_str.length() - 3);
+  }
   time_t status0_now1 = status0_now_str.toInt();
 
   JsonObject bgs0 = doc["bgs"][0];
   adjustTimezone(status0_now1);
-  time_t bgs0_datetime2 = bgs0["datetime"].as<String>().substring(0, 10).toInt();
+
+  String bgs_datetime_str = bgs0["datetime"].as<String>();
+  time_t bgs0_datetime2;
+
+  if (bgs_datetime_str.length() >= 10)
+  {
+    bgs0_datetime2 = bgs_datetime_str.substring(0, 10).toInt();
+  }
+  else
+  {
+    bgs0_datetime2 = status0_now1;
+  }
+
   adjustTimezone(bgs0_datetime2);
 
   struct timeval tv = {.tv_sec = status0_now1};
   settimeofday(&tv, NULL);
   setTime(status0_now1);
-  timeSynced = true;
 
-  strncpy(lastBG_char, bgs0["sgv"], sizeof(lastBG_char) - 1);
-  strncpy(lastDirection_char, bgs0["direction"], sizeof(lastDirection_char) - 1);
-  lastDelta_val = bgs0["bgdelta"];
-  lastBGSDateTime_val = bgs0_datetime2;
-  lastDataAgeMinutes_val = (status0_now1 - bgs0_datetime2) / 60;
-  hasLastData_val = true;
-  lastSuccessfulFetchTime = status0_now1;
-  lastBatteryVoltage_val = getBatteryVoltage();
+  // Зберігаємо в структуру
+  strncpy(rtcData.lastBG, bgs0["sgv"], sizeof(rtcData.lastBG) - 1);
+  strncpy(rtcData.lastDirection, bgs0["direction"], sizeof(rtcData.lastDirection) - 1);
+  rtcData.lastDelta = bgs0["bgdelta"];
+  rtcData.lastBGSDateTime = bgs0_datetime2;
+  rtcData.hasLastData = true;
 
+  struct timeval tv_now_check;
+  gettimeofday(&tv_now_check, NULL);
+  rtcData.lastSuccessfulFetchTime = tv_now_check.tv_sec;
+
+  rtcData.lastBatteryVoltage = getBatteryVoltage();
+  strcpy(rtcData.fetchStatus, "");
+
+  Serial.println("Glucose updated successfully!");
+  client.stop();
   return true;
 }
 
-// --- SYNC NTP (НОВА ФУНКЦІЯ) ---
+// --- SYNC NTP ---
 bool syncTimeNTP()
 {
   Serial.println("Syncing time via NTP...");
-  // Налаштовуємо час: offset у секундах, daylightOffset, адреса сервера
-  // Використовуємо вашу змінну timezone (2) * 3600 секунд
   configTime(timezone * 3600, 0, ntpServer);
 
   struct tm timeinfo;
-  // Чекаємо до 5 секунд на синхронізацію
   if (!getLocalTime(&timeinfo, 5000))
   {
     Serial.println("NTP Sync Failed");
     return false;
   }
-
   Serial.println("NTP Sync Success");
 
-  // Оновлюємо також TimeLib, щоб бібліотека time() і TimeLib були синхронізовані
   time_t now;
   time(&now);
   setTime(now);
-
-  timeSynced = true;
   return true;
 }
 
-// --- GET WEATHER (Optimized for Memory) ---
+// --- GET WEATHER (Optimized) ---
 bool getWeather()
 {
   WiFiClient client;
-
-  // Збільшимо таймаут до 10 секунд
-  client.setTimeout(10000);
+  client.setTimeout(15000);
 
   Serial.print("Connecting to weather... ");
   if (!client.connect(weatherHost, weatherPort))
   {
     Serial.println("Connection failed");
+    client.stop();
     return false;
   }
   Serial.println("Connected!");
 
-  // URL для запиту
   String url = "/v1/forecast?latitude=49.84&longitude=24.03&daily=weathercode,temperature_2m_max,temperature_2m_min&timezone=auto";
 
-  // !!! ВАЖЛИВО: Використовуємо HTTP/1.0, щоб уникнути Chunked Encoding
   client.print(String("GET ") + url + " HTTP/1.0\r\n" +
                "Host: " + weatherHost + "\r\n" +
                "Connection: close\r\n\r\n");
 
-  // Перевірка відповіді сервера
   unsigned long timeout = millis();
   while (client.available() == 0)
   {
-    if (millis() - timeout > 5000)
+    if (millis() - timeout > 15000)
     {
       Serial.println("Client Timeout !");
       client.stop();
@@ -521,7 +555,6 @@ bool getWeather()
     }
   }
 
-  // --- ПРОПУСК ЗАГОЛОВКІВ ---
   if (!client.find("\r\n\r\n"))
   {
     Serial.println("Invalid response (no headers)");
@@ -529,14 +562,12 @@ bool getWeather()
     return false;
   }
 
-  // --- ПАРСИНГ JSON ---
   StaticJsonDocument<200> filter;
   filter["daily"]["weathercode"] = true;
   filter["daily"]["temperature_2m_max"] = true;
   filter["daily"]["temperature_2m_min"] = true;
 
   DynamicJsonDocument doc(3072);
-
   DeserializationError error = deserializeJson(doc, client, DeserializationOption::Filter(filter));
 
   if (error)
@@ -561,6 +592,7 @@ bool getWeather()
   if (daily_code.size() == 0)
   {
     Serial.println("Arrays are empty!");
+    client.stop();
     return false;
   }
 
@@ -569,14 +601,14 @@ bool getWeather()
 
   for (int i = 0; i < 5; i++)
   {
-    weatherCodes[i] = daily_code[i];
-    tempMax[i] = daily_max[i];
-    tempMin[i] = daily_min[i];
-    weatherDates[i] = tv_now.tv_sec + (i * 86400);
+    rtcData.weatherCodes[i] = daily_code[i];
+    rtcData.tempMax[i] = daily_max[i];
+    rtcData.tempMin[i] = daily_min[i];
+    rtcData.weatherDates[i] = tv_now.tv_sec + (i * 86400);
   }
 
-  hasWeatherData = true;
-  lastWeatherFetchTime = tv_now.tv_sec;
+  rtcData.hasWeatherData = true;
+  rtcData.lastWeatherFetchTime = tv_now.tv_sec;
 
   Serial.println("Weather updated successfully!");
   client.stop();
@@ -591,17 +623,25 @@ void wifiTask(void *parameter)
     // 1. Glucose
     dataFetchedSuccessfully = getreadings();
 
-    // 1.1 FALLBACK: Якщо глюкоза не прийшла, беремо час з NTP
     if (!dataFetchedSuccessfully)
     {
-      Serial.println("Glucose failed. Attempting NTP time sync...");
+      Serial.println("First attempt failed. Retrying in 2 seconds...");
+      delay(2000);
+      dataFetchedSuccessfully = getreadings();
+    }
+
+    if (!dataFetchedSuccessfully)
+    {
+      Serial.println("Glucose failed twice. Syncing NTP...");
       syncTimeNTP();
+      // Зберігаємо поточний час, щоб знати, що ми спробували, але не вийшло
+      rtcData.lastSuccessfulFetchTime = 0;
     }
 
     // 2. Weather
     struct timeval tv_now;
     gettimeofday(&tv_now, NULL);
-    if (!hasWeatherData || (tv_now.tv_sec - lastWeatherFetchTime > 3600))
+    if (!rtcData.hasWeatherData || (tv_now.tv_sec - rtcData.lastWeatherFetchTime > 3600))
     {
       delay(100);
       weatherFetchedSuccessfully = getWeather();
@@ -612,7 +652,10 @@ void wifiTask(void *parameter)
     }
 
     WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    delay(100);
   }
+
   wifiTaskComplete = true;
   vTaskDelete(NULL);
 }
@@ -621,6 +664,9 @@ void wifiTask(void *parameter)
 void setup()
 {
   Serial.begin(115200);
+
+  // 1. Ініціалізація даних (з перевіркою магічного числа)
+  initRTC();
 
   pinMode(BUTTON_LEFT_PIN, INPUT_PULLUP);
   pinMode(BUTTON_RIGHT_PIN, INPUT_PULLUP);
@@ -638,9 +684,34 @@ void setup()
 
   bool wokeByTimer = (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER) || (wakeup_reason == ESP_SLEEP_WAKEUP_UNDEFINED);
   bool wokeByButton = (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0);
-  long time_since_last_fetch = (lastSuccessfulFetchTime == 0) ? LONG_MAX : (current_rtc_time - lastSuccessfulFetchTime);
 
-  bool needsUpdate = wokeByTimer || (time_since_last_fetch >= 300);
+  long time_since_last_fetch;
+
+  if (rtcData.lastSuccessfulFetchTime == 0)
+  {
+    time_since_last_fetch = LONG_MAX;
+  }
+  else if (current_rtc_time < rtcData.lastSuccessfulFetchTime)
+  {
+    Serial.println("Time Error: Resetting.");
+    time_since_last_fetch = LONG_MAX;
+    rtcData.lastSuccessfulFetchTime = 0;
+  }
+  else
+  {
+    time_since_last_fetch = current_rtc_time - rtcData.lastSuccessfulFetchTime;
+  }
+
+  bool needsUpdate = wokeByTimer || wokeByButton || (time_since_last_fetch >= 300);
+
+  // Якщо пробудження кнопкою, але ми вже кілька разів зафейлили WiFi, не мучимо пристрій
+  if (wokeByButton && rtcData.failedConnectionCount > 0)
+  {
+    needsUpdate = false;
+  }
+
+  Serial.print("Needs update: ");
+  Serial.println(needsUpdate);
 
   if (needsUpdate)
   {
@@ -652,8 +723,8 @@ void setup()
 
   if (wokeByButton)
   {
-    updateDisplay();
-    // !!! ЗМІНЕНО: Тепер чекаємо відпускання ПРАВОЇ кнопки
+    updateDisplay(); // Показуємо старі дані відразу!
+
     while (digitalRead(BUTTON_RIGHT_PIN) == LOW)
       delay(50);
     delay(100);
@@ -661,12 +732,11 @@ void setup()
     unsigned long lastInputTime = millis();
     while (millis() - lastInputTime < INTERACTIVE_TIMEOUT_MS)
     {
-      // Ліва/Права - Екрани
       if (digitalRead(BUTTON_LEFT_PIN) == LOW)
       {
-        currentScreenIndex++;
-        if (currentScreenIndex > 2)
-          currentScreenIndex = 0;
+        rtcData.currentScreenIndex++;
+        if (rtcData.currentScreenIndex > 2)
+          rtcData.currentScreenIndex = 0;
         weatherDayOffset = 0;
         updateDisplay();
         lastInputTime = millis();
@@ -674,16 +744,15 @@ void setup()
       }
       if (digitalRead(BUTTON_RIGHT_PIN) == LOW)
       {
-        currentScreenIndex--;
-        if (currentScreenIndex < 0)
-          currentScreenIndex = 2;
+        rtcData.currentScreenIndex--;
+        if (rtcData.currentScreenIndex < 0)
+          rtcData.currentScreenIndex = 2;
         weatherDayOffset = 0;
         updateDisplay();
         lastInputTime = millis();
         delay(250);
       }
-      // Додаткові - Погода
-      if (currentScreenIndex == 2)
+      if (rtcData.currentScreenIndex == 2)
       {
         if (digitalRead(BUTTON_PREV_PIN) == LOW)
         {
@@ -705,7 +774,6 @@ void setup()
 
       if (needsUpdate && wifiTaskComplete)
       {
-        // Оновлюємо екран, якщо прийшли дані (глюкоза АБО погода АБО просто NTP час)
         updateDisplay();
         needsUpdate = false;
       }
@@ -716,7 +784,7 @@ void setup()
   else
   {
     unsigned long startWait = millis();
-    while (!wifiTaskComplete && millis() - startWait < 25000)
+    while (!wifiTaskComplete && millis() - startWait < 30000)
     {
       if (digitalRead(BUTTON_LEFT_PIN) == LOW || digitalRead(BUTTON_RIGHT_PIN) == LOW)
         break;
@@ -724,15 +792,26 @@ void setup()
     }
   }
 
-  long remaining = 300 - (time_since_last_fetch % 300);
-  if (remaining < 10)
+  // --- SLEEP CALCULATION ---
+  gettimeofday(&tv_now, NULL);
+  current_rtc_time = tv_now.tv_sec;
+
+  long new_time_since = (rtcData.lastSuccessfulFetchTime == 0) ? 300 : (current_rtc_time - rtcData.lastSuccessfulFetchTime);
+
+  if (new_time_since < 0 || new_time_since >= 300)
+    new_time_since = 0;
+
+  long remaining = 300 - new_time_since;
+  if (remaining <= 0)
     remaining = 300;
+
+  Serial.print("Sleeping for: ");
+  Serial.println(remaining);
+  Serial.flush();
+
   esp_sleep_enable_timer_wakeup(remaining * 1000000ULL);
-  // !!! ЗМІНЕНО: Тепер будить ПРАВА кнопка
   esp_sleep_enable_ext0_wakeup(BUTTON_RIGHT_PIN, 0);
 
-  Serial.println("Sleep.");
-  Serial.flush();
   esp_deep_sleep_start();
 }
 
