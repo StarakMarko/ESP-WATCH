@@ -215,11 +215,11 @@ void drawGlucoseScreen(time_t datetimenow, String BG, int age, float batteryVolt
   String bgdelta = (delta > 0) ? "+" + String(delta) : String(delta);
   display.drawString(126, 50, bgdelta + " mg/dl ");
 
-  if (strlen(rtcData.fetchStatus) > 0)
-  {
-    display.setTextAlignment(TEXT_ALIGN_CENTER);
-    display.drawString(64, 53, String(rtcData.fetchStatus));
-  }
+  // if (strlen(rtcData.fetchStatus) > 0)
+  // {
+  //   display.setTextAlignment(TEXT_ALIGN_CENTER);
+  //   display.drawString(64, 53, String(rtcData.fetchStatus));
+  // }
 
   display.drawRect(0, 0, 128, 64);
   display.drawRect(0, 17, 128, 33);
