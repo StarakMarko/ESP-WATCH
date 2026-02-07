@@ -626,11 +626,14 @@ void wifiTask(void *parameter)
 // --- SETUP ---
 void setup()
 {
+  setCpuFrequencyMhz(80);
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // Вимкнення детектора просадки
   Serial.begin(115200);
 
   // 1. Перевіряємо та відновлюємо дані
   initDataManagement();
+
+  rtcData.lastBatteryVoltage = getBatteryVoltage();
 
   pinMode(BUTTON_LEFT_PIN, INPUT_PULLUP);
   pinMode(BUTTON_RIGHT_PIN, INPUT_PULLUP);
