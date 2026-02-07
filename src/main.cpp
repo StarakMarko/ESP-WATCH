@@ -91,6 +91,7 @@ String getWeatherDescription(int code);
 bool syncTimeNTP();
 void initDataManagement();
 void backupDataToFlash();
+int getBatteryPercentage(float voltage);
 
 // --- Bitmaps ---
 const unsigned char ArrowUp[] PROGMEM = {0x80, 0x00, 0xc0, 0x01, 0xe0, 0x03, 0xf0, 0x07, 0xf8, 0x0f, 0xfc, 0x1f, 0xde, 0x3d, 0xcf, 0x79, 0xc7, 0x71, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01};
@@ -204,7 +205,8 @@ void drawGlucoseScreen(time_t datetimenow, String BG, int age, float batteryVolt
 
   display.setFont(ArialMT_Plain_10);
   display.setTextAlignment(TEXT_ALIGN_LEFT);
-  display.drawString(2, 50, "Bat: " + String(batteryVoltage, 2) + "V");
+  int batPercent = getBatteryPercentage(batteryVoltage);
+  display.drawString(2, 50, "Bat: " + String(batPercent) + "%");
   display.setTextAlignment(TEXT_ALIGN_RIGHT);
   String bgdelta = (delta > 0) ? "+" + String(delta) : String(delta);
   display.drawString(126, 50, bgdelta + " mg/dl ");
@@ -239,7 +241,8 @@ void drawClockScreen(time_t datetimenow, float batteryVoltage)
 
   display.setFont(ArialMT_Plain_10);
   display.setTextAlignment(TEXT_ALIGN_RIGHT);
-  display.drawString(126, 0, String(batteryVoltage, 2) + "V");
+  int batPercent = getBatteryPercentage(batteryVoltage);
+  display.drawString(126, 0, String(batPercent) + "%");
   display.drawRect(0, 0, 128, 64);
   display.display();
 }
@@ -621,6 +624,23 @@ void wifiTask(void *parameter)
   }
   wifiTaskComplete = true;
   vTaskDelete(NULL);
+}
+
+int getBatteryPercentage(float voltage)
+{
+  // Налаштування меж для LiPo акумулятора
+  const float minV = 3.3; // 0%
+  const float maxV = 4.2; // 100%
+
+  if (voltage >= maxV)
+    return 100;
+  if (voltage <= minV)
+    return 0;
+
+  // Формула перетворення діапазону
+  float result = (voltage - minV) / (maxV - minV) * 100.0;
+
+  return (int)result;
 }
 
 // --- SETUP ---
