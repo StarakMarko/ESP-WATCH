@@ -11,7 +11,7 @@
 #include <driver/rtc_io.h>
 #include <sntp.h>
 #include <esp_wifi.h>
-#include <Preferences.h> // БІБЛІОТЕКА ДЛЯ ЗБЕРЕЖЕННЯ ДАНИХ У FLASH
+#include <Preferences.h>
 
 // --- !!! ЗАХИСТ ВІД ПЕРЕЗАВАНТАЖЕНЬ !!! ---
 #include "soc/soc.h"
@@ -26,8 +26,9 @@ const char *ntpServer = "pool.ntp.org";
 const char *weatherHost = "api.open-meteo.com";
 const int weatherPort = 80;
 
-const int timezone = 2;
-const int timezoneOffset = timezone * SECS_PER_MIN * 60;
+// --- НАЛАШТУВАННЯ ЧАСУ ---
+// Правило для України (Київський час): UTC+2 взимку, UTC+3 влітку
+const char *tzInfo = "EET-2EEST,M3.5.0/3,M10.5.0/4";
 
 #define I2C_SDA 44
 #define I2C_SCL 43
@@ -49,41 +50,33 @@ const int INTERACTIVE_TIMEOUT_MS = 6000;
 struct PersistentData
 {
   uint32_t magic;
-  // Глюкоза
   char lastBG[10];
   char lastDirection[20];
   int lastDelta;
   time_t lastBGSDateTime;
   bool hasLastData;
-  // Погода
   bool hasWeatherData;
   time_t lastWeatherFetchTime;
   int weatherCodes[5];
   float tempMax[5];
   float tempMin[5];
   time_t weatherDates[5];
-  // Системні
   time_t lastSuccessfulFetchTime;
   float lastBatteryVoltage;
   char fetchStatus[20];
   int failedConnectionCount;
-
-  // --- НОВА ЗМІННА ДЛЯ ЗБЕРЕЖЕННЯ ЕКРАНУ ---
   int savedScreen;
 };
 
 RTC_DATA_ATTR PersistentData rtcData;
 #define DATA_MAGIC 0xCAFEBABE
 
-// Об'єкт для роботи з Flash пам'яттю
 Preferences preferences;
 
 volatile bool wifiTaskComplete = false;
 volatile bool dataFetchedSuccessfully = false;
 volatile bool weatherFetchedSuccessfully = false;
 int weatherDayOffset = 0;
-
-// ЗМІННУ currentScreenIndexRAM ВИДАЛЕНО, використовуємо rtcData.savedScreen
 
 // --- Function Prototypes ---
 void drawGlucoseScreen(time_t datetimenow, String BG, int age, float batteryVoltage, String bgs0_direction, int delta);
@@ -95,6 +88,7 @@ bool syncTimeNTP();
 void initDataManagement();
 void backupDataToFlash();
 int getBatteryPercentage(float voltage);
+void adjustTimezone(time_t &timestamp);
 
 // --- Bitmaps ---
 const unsigned char ArrowUp[] PROGMEM = {0x80, 0x00, 0xc0, 0x01, 0xe0, 0x03, 0xf0, 0x07, 0xf8, 0x0f, 0xfc, 0x1f, 0xde, 0x3d, 0xcf, 0x79, 0xc7, 0x71, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01};
@@ -122,9 +116,20 @@ float getBatteryVoltage()
   return rawVoltage * calibration_factor;
 }
 
+// НОВА ФУНКЦІЯ: Перетворює UTC у локальний час за правилом tzInfo
 void adjustTimezone(time_t &timestamp)
 {
-  timestamp += timezoneOffset;
+  struct tm timeinfo;
+  localtime_r(&timestamp, &timeinfo);
+  TimeElements te;
+  te.Second = timeinfo.tm_sec;
+  te.Minute = timeinfo.tm_min;
+  te.Hour = timeinfo.tm_hour;
+  te.Wday = timeinfo.tm_wday + 1;
+  te.Day = timeinfo.tm_mday;
+  te.Month = timeinfo.tm_mon + 1;
+  te.Year = timeinfo.tm_year + 1900 - 1970;
+  timestamp = makeTime(te);
 }
 
 // --- DISPLAY UPDATE MANAGER ---
@@ -132,20 +137,23 @@ void updateDisplay()
 {
   struct timeval tv_now;
   gettimeofday(&tv_now, NULL);
-  time_t current_rtc_time = tv_now.tv_sec;
-  setTime(current_rtc_time);
+  time_t current_rtc_time = tv_now.tv_sec; // Системний час (UTC)
 
-  // ВИКОРИСТОВУЄМО ЗБЕРЕЖЕНУ ЗМІННУ
+  // Час лише для малювання на екрані (Локальний)
+  time_t local_display_time = current_rtc_time;
+  adjustTimezone(local_display_time);
+  setTime(local_display_time);
+
   if (rtcData.savedScreen == 0)
-  { // SCREEN 0: GLUCOSE
+  {
     if (rtcData.hasLastData)
     {
+      // Вік даних рахуємо чисто в UTC, щоб перехід часу не давав збоїв
       int current_data_age = (current_rtc_time - rtcData.lastBGSDateTime) / 60;
       if (current_data_age < 0)
         current_data_age = 0;
 
-      // Якщо дані старі (після перезавантаження), додаємо позначку "R" (Restored)
-      drawGlucoseScreen(current_rtc_time, String(rtcData.lastBG), current_data_age, rtcData.lastBatteryVoltage, String(rtcData.lastDirection), rtcData.lastDelta);
+      drawGlucoseScreen(local_display_time, String(rtcData.lastBG), current_data_age, rtcData.lastBatteryVoltage, String(rtcData.lastDirection), rtcData.lastDelta);
     }
     else
     {
@@ -163,12 +171,12 @@ void updateDisplay()
     }
   }
   else if (rtcData.savedScreen == 1)
-  { // SCREEN 1: CLOCK
-    drawClockScreen(current_rtc_time, rtcData.lastBatteryVoltage);
+  {
+    drawClockScreen(local_display_time, rtcData.lastBatteryVoltage);
   }
   else if (rtcData.savedScreen == 2)
-  { // SCREEN 2: WEATHER
-    drawWeatherScreen(current_rtc_time);
+  {
+    drawWeatherScreen(local_display_time);
   }
 }
 
@@ -190,7 +198,7 @@ void drawGlucoseScreen(time_t datetimenow, String BG, int age, float batteryVolt
   display.setFont(ArialMT_Plain_24);
   display.setTextAlignment(TEXT_ALIGN_CENTER);
   display.drawString(45, 19, BG);
-  display.drawString(46, 19, BG); // Bold
+  display.drawString(46, 19, BG);
 
   if (bgs0_direction == "Flat")
     display.drawXbm(101, 26, 16, 16, ArrowSide);
@@ -214,12 +222,6 @@ void drawGlucoseScreen(time_t datetimenow, String BG, int age, float batteryVolt
   display.setTextAlignment(TEXT_ALIGN_RIGHT);
   String bgdelta = (delta > 0) ? "+" + String(delta) : String(delta);
   display.drawString(126, 50, bgdelta + " mg/dl ");
-
-  // if (strlen(rtcData.fetchStatus) > 0)
-  // {
-  //   display.setTextAlignment(TEXT_ALIGN_CENTER);
-  //   display.drawString(64, 53, String(rtcData.fetchStatus));
-  // }
 
   display.drawRect(0, 0, 128, 64);
   display.drawRect(0, 17, 128, 33);
@@ -274,6 +276,8 @@ void drawWeatherScreen(time_t datetimenow)
     weatherDayOffset = 4;
 
   time_t forecastTime = rtcData.weatherDates[weatherDayOffset];
+  adjustTimezone(forecastTime); // Переводимо дату прогнозу в локальний час
+
   String dateStr = String(day(forecastTime)) + "/" + String(month(forecastTime));
   if (weatherDayOffset == 0)
     dateStr = "Today";
@@ -316,38 +320,26 @@ void drawWeatherScreen(time_t datetimenow)
   display.display();
 }
 
-// --- DATA MANAGEMENT FUNCTIONS (FLASH BACKUP) ---
-
-// 1. Збереження у Flash
+// --- DATA MANAGEMENT FUNCTIONS ---
 void backupDataToFlash()
 {
   Serial.println("Backing up data to Flash...");
-  preferences.begin("glucose_data", false); // "glucose_data" - назва розділу пам'яті
-
-  // Записуємо всю структуру rtcData як набір байтів
+  preferences.begin("glucose_data", false);
   preferences.putBytes("data", &rtcData, sizeof(PersistentData));
-
   preferences.end();
   Serial.println("Backup complete.");
 }
 
-// 2. Ініціалізація та відновлення
 void initDataManagement()
 {
   if (rtcData.magic != DATA_MAGIC)
   {
-    Serial.println("Data invalid/corrupted (Power Loss?). Trying to restore from Flash...");
-
-    preferences.begin("glucose_data", true); // Тільки для читання
-
-    // Перевіряємо, чи є збережені дані
+    Serial.println("Data invalid/corrupted. Trying to restore from Flash...");
+    preferences.begin("glucose_data", true);
     if (preferences.isKey("data"))
     {
-      // Читаємо дані з Flash назад у rtcData
       preferences.getBytes("data", &rtcData, sizeof(PersistentData));
       Serial.println("Data restored from Flash successfully!");
-
-      // Оновлюємо магічне число, щоб знати, що тепер в RAM все ок
       rtcData.magic = DATA_MAGIC;
     }
     else
@@ -355,7 +347,6 @@ void initDataManagement()
       Serial.println("No backup found. Clean start.");
       memset(&rtcData, 0, sizeof(PersistentData));
       rtcData.magic = DATA_MAGIC;
-      // ВСТАНОВЛЮЄМО ЕКРАН ЗА ЗАМОВЧУВАННЯМ ПРИ ПЕРШОМУ ЗАПУСКУ
       rtcData.savedScreen = 0;
     }
     preferences.end();
@@ -403,19 +394,11 @@ bool connectToWiFi()
   {
     Serial.println("\nFailed to connect.");
     strcpy(rtcData.fetchStatus, "WiFi Fail");
-
     rtcData.failedConnectionCount++;
     if (rtcData.failedConnectionCount < 3)
-    {
-      Serial.println("Restarting ESP to fix WiFi...");
-      // Тут ми вже не боїмося рестарту, бо дані на Flash!
       ESP.restart();
-    }
     else
-    {
       rtcData.failedConnectionCount = 0;
-    }
-
     return false;
   }
 }
@@ -468,19 +451,18 @@ bool getreadings()
   String status0_now_str = doc["status"][0]["now"].as<String>();
   if (status0_now_str.length() > 3)
     status0_now_str = status0_now_str.substring(0, status0_now_str.length() - 3);
-  time_t status0_now1 = status0_now_str.toInt();
+  time_t status0_now1 = status0_now_str.toInt(); // Отримуємо чистий UTC
 
   JsonObject bgs0 = doc["bgs"][0];
-  adjustTimezone(status0_now1);
 
   String bgs_datetime_str = bgs0["datetime"].as<String>();
   time_t bgs0_datetime2;
   if (bgs_datetime_str.length() >= 10)
     bgs0_datetime2 = bgs_datetime_str.substring(0, 10).toInt();
   else
-    bgs0_datetime2 = status0_now1;
-  adjustTimezone(bgs0_datetime2);
+    bgs0_datetime2 = status0_now1; // Отримуємо чистий UTC
 
+  // Встановлюємо системний час чистим UTC
   struct timeval tv = {.tv_sec = status0_now1};
   settimeofday(&tv, NULL);
   setTime(status0_now1);
@@ -488,7 +470,7 @@ bool getreadings()
   strncpy(rtcData.lastBG, bgs0["sgv"], sizeof(rtcData.lastBG) - 1);
   strncpy(rtcData.lastDirection, bgs0["direction"], sizeof(rtcData.lastDirection) - 1);
   rtcData.lastDelta = bgs0["bgdelta"];
-  rtcData.lastBGSDateTime = bgs0_datetime2;
+  rtcData.lastBGSDateTime = bgs0_datetime2; // Зберігаємо як UTC
   rtcData.hasLastData = true;
 
   struct timeval tv_now_check;
@@ -498,8 +480,6 @@ bool getreadings()
   strcpy(rtcData.fetchStatus, "");
 
   Serial.println("Glucose success!");
-
-  // !!! ЗБЕРІГАЄМО У FLASH !!!
   backupDataToFlash();
 
   client.stop();
@@ -509,14 +489,9 @@ bool getreadings()
 // --- SYNC NTP ---
 bool syncTimeNTP()
 {
-  configTime(timezone * 3600, 0, ntpServer);
+  configTzTime(tzInfo, ntpServer);
   struct tm timeinfo;
-  if (!getLocalTime(&timeinfo, 5000))
-    return false;
-  time_t now;
-  time(&now);
-  setTime(now);
-  return true;
+  return getLocalTime(&timeinfo, 5000);
 }
 
 // --- GET WEATHER ---
@@ -582,13 +557,12 @@ bool getWeather()
     rtcData.weatherCodes[i] = daily_code[i];
     rtcData.tempMax[i] = daily_max[i];
     rtcData.tempMin[i] = daily_min[i];
-    rtcData.weatherDates[i] = tv_now.tv_sec + (i * 86400);
+    rtcData.weatherDates[i] = tv_now.tv_sec + (i * 86400); // Зберігаємо як UTC
   }
 
   rtcData.hasWeatherData = true;
   rtcData.lastWeatherFetchTime = tv_now.tv_sec;
 
-  // !!! ЗБЕРІГАЄМО У FLASH (Оновлюємо бекап) !!!
   backupDataToFlash();
 
   client.stop();
@@ -634,29 +608,26 @@ void wifiTask(void *parameter)
 
 int getBatteryPercentage(float voltage)
 {
-  // Налаштування меж для LiPo акумулятора
-  const float minV = 3.3; // 0%
-  const float maxV = 4.2; // 100%
-
+  const float minV = 3.3;
+  const float maxV = 4.2;
   if (voltage >= maxV)
     return 100;
   if (voltage <= minV)
     return 0;
-
-  // Формула перетворення діапазону
-  float result = (voltage - minV) / (maxV - minV) * 100.0;
-
-  return (int)result;
+  return (int)((voltage - minV) / (maxV - minV) * 100.0);
 }
 
 // --- SETUP ---
 void setup()
 {
   setCpuFrequencyMhz(80);
-  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // Вимкнення детектора просадки
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
   Serial.begin(115200);
 
-  // 1. Перевіряємо та відновлюємо дані
+  // Налаштовуємо глобальне середовище для роботи з часом
+  setenv("TZ", tzInfo, 1);
+  tzset();
+
   initDataManagement();
 
   rtcData.lastBatteryVoltage = getBatteryVoltage();
@@ -668,7 +639,6 @@ void setup()
 
   display.init();
   display.flipScreenVertically();
-  // --- ЗНИЖУЄМО ЯСКРАВІСТЬ ДЛЯ ЕКОНОМІЇ (Було 255) ---
   display.setContrast(100);
   display.clear();
 
