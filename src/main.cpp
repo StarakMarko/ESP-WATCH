@@ -3,31 +3,20 @@
 #include <OLEDDisplayFonts.h>
 #include <OLEDDisplayUi.h>
 #include <SSD1306Wire.h>
-#include <WiFi.h>
-#include <ArduinoJson.h>
 #include <TimeLib.h>
 #include <time.h>
 #include <esp_sleep.h>
 #include <driver/rtc_io.h>
-#include <sntp.h>
-#include <esp_wifi.h>
 #include <Preferences.h>
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEServer.h>
 
 // --- !!! ЗАХИСТ ВІД ПЕРЕЗАВАНТАЖЕНЬ !!! ---
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
 
-// --- Configuration ---
-const char *ssid = "Redmi Note 11";
-const char *password = "123456781";
-
-const int httpPort = 17580;
-const char *ntpServer = "pool.ntp.org";
-const char *weatherHost = "api.open-meteo.com";
-const int weatherPort = 80;
-
 // --- НАЛАШТУВАННЯ ЧАСУ ---
-// Правило для України (Київський час): UTC+2 взимку, UTC+3 влітку
 const char *tzInfo = "EET-2EEST,M3.5.0/3,M10.5.0/4";
 
 #define I2C_SDA 44
@@ -44,7 +33,11 @@ const float R1 = 67000.0;
 const float R2 = 67000.0;
 const float ADC_MAX_VOLTAGE = 3.3;
 const int ADC_RESOLUTION = 4095;
-const int INTERACTIVE_TIMEOUT_MS = 6000;
+
+// --- BLE UUIDs ---
+#define SERVICE_UUID "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define DATA_CHAR_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+#define SETTINGS_CHAR_UUID "a1b2c3d4-e5f6-7890-1234-56789abcdef0"
 
 // --- СТРУКТУРА ДАНИХ ---
 struct PersistentData
@@ -64,34 +57,25 @@ struct PersistentData
   time_t lastSuccessfulFetchTime;
   float lastBatteryVoltage;
   char fetchStatus[20];
-  int failedConnectionCount;
+  uint16_t bgHistory[64]; // Масив для графіка
   int savedScreen;
+  int screenTimeoutMs;
+  bool nightMode;
 };
 
 RTC_DATA_ATTR PersistentData rtcData;
-#define DATA_MAGIC 0xCAFEBABE
-
+#define DATA_MAGIC 0xBEEF0001 // Оновлено для очищення старих "зламаних" крапок
 Preferences preferences;
 
-volatile bool wifiTaskComplete = false;
-volatile bool dataFetchedSuccessfully = false;
-volatile bool weatherFetchedSuccessfully = false;
+// --- СТАТУСИ ---
+volatile bool bleTaskComplete = false;
+volatile bool newDataReceived = false;
+volatile bool deviceConnected = false;
+volatile bool screenNeedsUpdate = false;
 int weatherDayOffset = 0;
 
-// --- Function Prototypes ---
-void drawGlucoseScreen(time_t datetimenow, String BG, int age, float batteryVoltage, String bgs0_direction, int delta);
-void drawClockScreen(time_t datetimenow, float batteryVoltage);
-void drawWeatherScreen(time_t datetimenow);
-void updateDisplay();
-String getWeatherDescription(int code);
-bool syncTimeNTP();
-void initDataManagement();
-void backupDataToFlash();
-int getBatteryPercentage(float voltage);
-void adjustTimezone(time_t &timestamp);
-
-// --- Bitmaps ---
-const unsigned char ArrowUp[] PROGMEM = {0x80, 0x00, 0xc0, 0x01, 0xe0, 0x03, 0xf0, 0x07, 0xf8, 0x0f, 0xfc, 0x1f, 0xde, 0x3d, 0xcf, 0x79, 0xc7, 0x71, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01};
+// --- Bitmaps (Для екрана глюкози) ---
+const unsigned char ArrowUp[] PROGMEM = {0x80, 0x00, 0xc0, 0x01, 0xe0, 0x03, 0xf0, 0x07, 0xf8, 0x0f, 0xfc, 0x1f, 0xde, 0x3d, 0xcf, 0x79, 0xc7, 0x71, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01};
 const unsigned char ArrowDown[] PROGMEM = {0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc7, 0x71, 0xcf, 0x79, 0xde, 0x3d, 0xfc, 0x1f, 0xf8, 0x0f, 0xf0, 0x07, 0xe0, 0x03, 0xc0, 0x01, 0x80, 0x00};
 const unsigned char ArrowUpS[] PROGMEM = {0x00, 0x00, 0x00, 0x00, 0xf8, 0x3f, 0xf8, 0x3f, 0xf8, 0x3f, 0x00, 0x3f, 0x80, 0x3f, 0xc0, 0x3f, 0xe0, 0x3f, 0xf0, 0x39, 0xf8, 0x38, 0x7c, 0x38, 0x3c, 0x38, 0x1c, 0x00, 0x00, 0x00, 0x00, 0x00};
 const unsigned char ArrowDownS[] PROGMEM = {0x00, 0x00, 0x00, 0x00, 0x1c, 0x00, 0x3c, 0x38, 0x7c, 0x38, 0xf8, 0x38, 0xf0, 0x39, 0xe0, 0x3f, 0xc0, 0x3f, 0x80, 0x3f, 0x00, 0x3f, 0xf8, 0x3f, 0xf8, 0x3f, 0xf8, 0x3f, 0x00, 0x00, 0x00, 0x00};
@@ -99,12 +83,23 @@ const unsigned char ArrowSide[] PROGMEM = {0x80, 0x01, 0x80, 0x03, 0x80, 0x07, 0
 const unsigned char ArrowUpD[] PROGMEM = {0x08, 0x10, 0x1c, 0x38, 0x2a, 0x54, 0x49, 0x92, 0x88, 0x11, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10};
 const unsigned char ArrowDownD[] PROGMEM = {0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x88, 0x11, 0x49, 0x92, 0x2a, 0x54, 0x1c, 0x38, 0x08, 0x10};
 
-// --- Weather Icons ---
-const unsigned char IconSun[] PROGMEM = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x0f, 0x00, 0x00, 0xfc, 0x3f, 0x00, 0x00, 0xfe, 0x7f, 0x00, 0x80, 0xff, 0xff, 0x01, 0x80, 0xff, 0xff, 0x01, 0xc0, 0xff, 0xff, 0x03, 0xe0, 0xff, 0xff, 0x07, 0xe0, 0xff, 0xff, 0x07, 0xf0, 0xff, 0xff, 0x0f, 0xf0, 0xff, 0xff, 0x0f, 0xf0, 0xff, 0xff, 0x0f, 0xf0, 0xff, 0xff, 0x0f, 0xf0, 0xff, 0xff, 0x0f, 0xe0, 0xff, 0xff, 0x07, 0xe0, 0xff, 0xff, 0x07, 0xc0, 0xff, 0xff, 0x03, 0x80, 0xff, 0xff, 0x01, 0x80, 0xff, 0xff, 0x01, 0x00, 0xfe, 0x7f, 0x00, 0x00, 0xfc, 0x3f, 0x00, 0x00, 0xf0, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-const unsigned char IconCloud[] PROGMEM = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x03, 0x00, 0x00, 0xFC, 0x0F, 0x00, 0x00, 0x0E, 0x1C, 0x00, 0x00, 0x02, 0x30, 0x00, 0x00, 0x03, 0x60, 0x00, 0x80, 0x01, 0x40, 0x00, 0xC0, 0x00, 0xC0, 0x00, 0x60, 0x00, 0x80, 0x01, 0x20, 0x00, 0x00, 0x01, 0x30, 0x00, 0x00, 0x03, 0x30, 0x00, 0x00, 0x02, 0x30, 0x00, 0x00, 0x02, 0x30, 0x00, 0x00, 0x02, 0x30, 0x00, 0x00, 0x02, 0x20, 0x00, 0x00, 0x01, 0x60, 0x00, 0x80, 0x01, 0xC0, 0x00, 0xC0, 0x00, 0x80, 0xFF, 0x7F, 0x00, 0x00, 0xFF, 0x3F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-const unsigned char IconRain[] PROGMEM = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x03, 0x00, 0x00, 0xFC, 0x0F, 0x00, 0x00, 0x0E, 0x1C, 0x00, 0x00, 0x02, 0x30, 0x00, 0x00, 0x03, 0x60, 0x00, 0x80, 0x01, 0x40, 0x00, 0xC0, 0x00, 0xC0, 0x00, 0x60, 0x00, 0x80, 0x01, 0x20, 0x00, 0x00, 0x01, 0x30, 0x00, 0x00, 0x03, 0x30, 0x00, 0x00, 0x02, 0x30, 0x00, 0x00, 0x02, 0x30, 0x00, 0x00, 0x02, 0x30, 0x00, 0x00, 0x02, 0x20, 0x00, 0x00, 0x01, 0x60, 0x00, 0x80, 0x01, 0xC0, 0x00, 0xC0, 0x00, 0x80, 0xFF, 0x7F, 0x00, 0x00, 0xFF, 0x3F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x01, 0x00, 0x00, 0x80, 0x01, 0x00, 0x20, 0x40, 0x08, 0x00, 0x20, 0x40, 0x08, 0x00, 0x10, 0x20, 0x04, 0x00, 0x10, 0x20, 0x04, 0x00, 0x08, 0x10, 0x02, 0x00, 0x08, 0x10, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-const unsigned char IconSnow[] PROGMEM = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x03, 0x00, 0x00, 0xFC, 0x0F, 0x00, 0x00, 0x0E, 0x1C, 0x00, 0x00, 0x02, 0x30, 0x00, 0x00, 0x03, 0x60, 0x00, 0x80, 0x01, 0x40, 0x00, 0xC0, 0x00, 0xC0, 0x00, 0x60, 0x00, 0x80, 0x01, 0x20, 0x00, 0x00, 0x01, 0x30, 0x00, 0x00, 0x03, 0x30, 0x00, 0x00, 0x02, 0x30, 0x00, 0x00, 0x02, 0x30, 0x00, 0x00, 0x02, 0x30, 0x00, 0x00, 0x02, 0x20, 0x00, 0x00, 0x01, 0x60, 0x00, 0x80, 0x01, 0xC0, 0x00, 0xC0, 0x00, 0x80, 0xFF, 0x7F, 0x00, 0x00, 0xFF, 0x3F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x44, 0x11, 0x00, 0x00, 0x28, 0x0A, 0x00, 0x00, 0x10, 0x04, 0x00, 0x00, 0x28, 0x0A, 0x00, 0x00, 0x44, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-const unsigned char IconThunder[] PROGMEM = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x03, 0x00, 0x00, 0xFC, 0x0F, 0x00, 0x00, 0x0E, 0x1C, 0x00, 0x00, 0x02, 0x30, 0x00, 0x00, 0x03, 0x60, 0x00, 0x80, 0x01, 0x40, 0x00, 0xC0, 0x00, 0xC0, 0x00, 0x60, 0x00, 0x80, 0x01, 0x20, 0x00, 0x00, 0x01, 0x30, 0x00, 0x00, 0x03, 0x30, 0x00, 0x00, 0x02, 0x30, 0x00, 0x00, 0x02, 0x30, 0x00, 0x00, 0x02, 0x20, 0x00, 0x00, 0x01, 0x60, 0x00, 0x80, 0x01, 0xC0, 0x00, 0xC0, 0x00, 0x80, 0xFF, 0x7F, 0x00, 0x00, 0xFF, 0x3F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x30, 0x00, 0x00, 0x00, 0x60, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0xFF, 0x01, 0x00, 0x00, 0x1E, 0x00, 0x00, 0x00, 0x1C, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+// --- 8-BIT WEATHER ICONS (16x16) ---
+const uint8_t W_Sun[] PROGMEM = {
+    0x80, 0x01, 0x80, 0x01, 0x00, 0x00, 0x04, 0x20,
+    0x28, 0x14, 0xc0, 0x03, 0x20, 0x04, 0x13, 0xc8,
+    0x13, 0xc8, 0x20, 0x04, 0xc0, 0x03, 0x28, 0x14,
+    0x04, 0x20, 0x00, 0x00, 0x80, 0x01, 0x80, 0x01};
+const uint8_t W_Cloud[] PROGMEM = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x03, 0xc0, 0x0f, 0xe0, 0x1f, 0xf0, 0x3f, 0xf8, 0x7f, 0xfc, 0xff, 0xfc, 0xff, 0xfc, 0xff, 0xf8, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+const uint8_t W_Rain[] PROGMEM = {0x00, 0x00, 0x00, 0x00, 0x80, 0x03, 0xc0, 0x0f, 0xe0, 0x1f, 0xf0, 0x3f, 0xf8, 0x7f, 0xfc, 0xff, 0xfc, 0xff, 0xfc, 0xff, 0xf8, 0x7f, 0x00, 0x00, 0x24, 0x24, 0x12, 0x48, 0x24, 0x24, 0x12, 0x48};
+const uint8_t W_Snow[] PROGMEM = {0x00, 0x00, 0x00, 0x00, 0x80, 0x03, 0xc0, 0x0f, 0xe0, 0x1f, 0xf0, 0x3f, 0xf8, 0x7f, 0xfc, 0xff, 0xfc, 0xff, 0xfc, 0xff, 0xf8, 0x7f, 0x00, 0x00, 0x42, 0x42, 0x24, 0x24, 0x42, 0x42, 0x00, 0x00};
+const uint8_t W_Thunder[] PROGMEM = {0x00, 0x00, 0x00, 0x00, 0x80, 0x03, 0xc0, 0x0f, 0xe0, 0x1f, 0xf0, 0x3f, 0xf8, 0x7f, 0xfc, 0xff, 0xfc, 0xff, 0xfc, 0xff, 0xf8, 0x7f, 0x00, 0x00, 0x20, 0x04, 0x60, 0x0c, 0xc0, 0x03, 0x40, 0x01};
+
+// --- ПОВНА ТАБЛИЦЯ ASCII РЕТРО-ШРИФТУ 5x7 ---
+const char *const _DOW_NAMES[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+const char *const _MON_NAMES[] = {"", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+
+const uint8_t font5x7[95][5] PROGMEM = {
+    {0x00, 0x00, 0x00, 0x00, 0x00}, {0x00, 0x00, 0x2f, 0x00, 0x00}, {0x00, 0x07, 0x00, 0x07, 0x00}, {0x14, 0x7f, 0x14, 0x7f, 0x14}, {0x24, 0x2a, 0x7f, 0x2a, 0x12}, {0x23, 0x13, 0x08, 0x64, 0x62}, {0x36, 0x49, 0x55, 0x22, 0x50}, {0x00, 0x05, 0x03, 0x00, 0x00}, {0x00, 0x1c, 0x22, 0x41, 0x00}, {0x00, 0x41, 0x22, 0x1c, 0x00}, {0x14, 0x08, 0x3e, 0x08, 0x14}, {0x08, 0x08, 0x3e, 0x08, 0x08}, {0x00, 0x00, 0x50, 0x30, 0x00}, {0x08, 0x08, 0x08, 0x08, 0x08}, {0x00, 0x60, 0x60, 0x00, 0x00}, {0x20, 0x10, 0x08, 0x04, 0x02}, {0x3e, 0x51, 0x49, 0x45, 0x3e}, {0x00, 0x42, 0x7f, 0x40, 0x00}, {0x42, 0x61, 0x51, 0x49, 0x46}, {0x21, 0x41, 0x45, 0x4b, 0x31}, {0x18, 0x14, 0x12, 0x7f, 0x10}, {0x27, 0x45, 0x45, 0x45, 0x39}, {0x3c, 0x4a, 0x49, 0x49, 0x30}, {0x01, 0x71, 0x09, 0x05, 0x03}, {0x36, 0x49, 0x49, 0x49, 0x36}, {0x06, 0x49, 0x49, 0x29, 0x1e}, {0x00, 0x36, 0x36, 0x00, 0x00}, {0x00, 0x56, 0x36, 0x00, 0x00}, {0x08, 0x14, 0x22, 0x41, 0x00}, {0x14, 0x14, 0x14, 0x14, 0x14}, {0x00, 0x41, 0x22, 0x14, 0x08}, {0x02, 0x01, 0x51, 0x09, 0x06}, {0x32, 0x49, 0x79, 0x41, 0x3e}, {0x7e, 0x11, 0x11, 0x11, 0x7e}, {0x7f, 0x49, 0x49, 0x49, 0x36}, {0x3e, 0x41, 0x41, 0x41, 0x22}, {0x7f, 0x41, 0x41, 0x22, 0x1c}, {0x7f, 0x49, 0x49, 0x49, 0x41}, {0x7f, 0x09, 0x09, 0x09, 0x01}, {0x3e, 0x41, 0x49, 0x49, 0x7a}, {0x7f, 0x08, 0x08, 0x08, 0x7f}, {0x00, 0x41, 0x7f, 0x41, 0x00}, {0x20, 0x40, 0x41, 0x3f, 0x01}, {0x7f, 0x08, 0x14, 0x22, 0x41}, {0x7f, 0x40, 0x40, 0x40, 0x40}, {0x7f, 0x02, 0x0c, 0x02, 0x7f}, {0x7f, 0x04, 0x08, 0x10, 0x7f}, {0x3e, 0x41, 0x41, 0x41, 0x3e}, {0x7f, 0x09, 0x09, 0x09, 0x06}, {0x3e, 0x41, 0x51, 0x21, 0x5e}, {0x7f, 0x09, 0x19, 0x29, 0x46}, {0x46, 0x49, 0x49, 0x49, 0x31}, {0x01, 0x01, 0x7f, 0x01, 0x01}, {0x3f, 0x40, 0x40, 0x40, 0x3f}, {0x1f, 0x20, 0x40, 0x20, 0x1f}, {0x3f, 0x40, 0x38, 0x40, 0x3f}, {0x63, 0x14, 0x08, 0x14, 0x63}, {0x07, 0x08, 0x70, 0x08, 0x07}, {0x61, 0x51, 0x49, 0x45, 0x43}, {0x00, 0x7f, 0x41, 0x41, 0x00}, {0x02, 0x04, 0x08, 0x10, 0x20}, {0x00, 0x41, 0x41, 0x7f, 0x00}, {0x04, 0x02, 0x01, 0x02, 0x04}, {0x40, 0x40, 0x40, 0x40, 0x40}, {0x00, 0x01, 0x02, 0x04, 0x00}, {0x20, 0x54, 0x54, 0x54, 0x78}, {0x7f, 0x48, 0x44, 0x44, 0x38}, {0x38, 0x44, 0x44, 0x44, 0x20}, {0x38, 0x44, 0x44, 0x48, 0x7f}, {0x38, 0x54, 0x54, 0x54, 0x18}, {0x08, 0x7e, 0x09, 0x01, 0x02}, {0x0c, 0x52, 0x52, 0x52, 0x3e}, {0x7f, 0x08, 0x04, 0x04, 0x78}, {0x00, 0x44, 0x7d, 0x40, 0x00}, {0x20, 0x40, 0x44, 0x3d, 0x00}, {0x7f, 0x10, 0x28, 0x44, 0x00}, {0x00, 0x41, 0x7f, 0x40, 0x00}, {0x7c, 0x04, 0x18, 0x04, 0x78}, {0x7c, 0x08, 0x04, 0x04, 0x78}, {0x38, 0x44, 0x44, 0x44, 0x38}, {0x7c, 0x14, 0x14, 0x14, 0x08}, {0x08, 0x14, 0x14, 0x18, 0x7c}, {0x7c, 0x08, 0x04, 0x04, 0x08}, {0x48, 0x54, 0x54, 0x54, 0x20}, {0x04, 0x3f, 0x44, 0x40, 0x20}, {0x3c, 0x40, 0x40, 0x20, 0x7c}, {0x1c, 0x20, 0x40, 0x20, 0x1c}, {0x3c, 0x40, 0x30, 0x40, 0x3c}, {0x44, 0x28, 0x10, 0x28, 0x44}, {0x0c, 0x50, 0x50, 0x50, 0x3c}, {0x44, 0x64, 0x54, 0x4c, 0x44}, {0x00, 0x08, 0x36, 0x41, 0x00}, {0x00, 0x00, 0x7f, 0x00, 0x00}, {0x00, 0x41, 0x36, 0x08, 0x00}, {0x10, 0x08, 0x10, 0x08, 0x00}};
 
 // --- Helper Functions ---
 float getBatteryVoltage()
@@ -112,11 +107,18 @@ float getBatteryVoltage()
   float calibration_factor = 1.0752;
   int analogValue = analogRead(BATTERY_PIN);
   float voltageAtADC = (float)analogValue * (ADC_MAX_VOLTAGE / ADC_RESOLUTION);
-  float rawVoltage = voltageAtADC * (R1 + R2) / R2;
-  return rawVoltage * calibration_factor;
+  return (voltageAtADC * (R1 + R2) / R2) * calibration_factor;
 }
 
-// НОВА ФУНКЦІЯ: Перетворює UTC у локальний час за правилом tzInfo
+int getBatteryPercentage(float voltage)
+{
+  if (voltage >= 4.2)
+    return 100;
+  if (voltage <= 3.3)
+    return 0;
+  return (int)((voltage - 3.3) / 0.9 * 100.0);
+}
+
 void adjustTimezone(time_t &timestamp)
 {
   struct tm timeinfo;
@@ -132,73 +134,105 @@ void adjustTimezone(time_t &timestamp)
   timestamp = makeTime(te);
 }
 
-// --- DISPLAY UPDATE MANAGER ---
-void updateDisplay()
+void backupDataToFlash()
 {
-  struct timeval tv_now;
-  gettimeofday(&tv_now, NULL);
-  time_t current_rtc_time = tv_now.tv_sec; // Системний час (UTC)
+  preferences.begin("glucose_data", false);
+  preferences.putBytes("data", &rtcData, sizeof(PersistentData));
+  preferences.end();
+}
 
-  // Час лише для малювання на екрані (Локальний)
-  time_t local_display_time = current_rtc_time;
-  adjustTimezone(local_display_time);
-  setTime(local_display_time);
-
-  if (rtcData.savedScreen == 0)
+void initDataManagement()
+{
+  if (rtcData.magic != DATA_MAGIC)
   {
-    if (rtcData.hasLastData)
+    preferences.begin("glucose_data", true);
+    if (preferences.isKey("data"))
     {
-      // Вік даних рахуємо чисто в UTC, щоб перехід часу не давав збоїв
-      int current_data_age = (current_rtc_time - rtcData.lastBGSDateTime) / 60;
-      if (current_data_age < 0)
-        current_data_age = 0;
-
-      drawGlucoseScreen(local_display_time, String(rtcData.lastBG), current_data_age, rtcData.lastBatteryVoltage, String(rtcData.lastDirection), rtcData.lastDelta);
+      preferences.getBytes("data", &rtcData, sizeof(PersistentData));
+      rtcData.magic = DATA_MAGIC;
     }
     else
     {
-      display.clear();
-      display.displayOn();
-      display.setFont(ArialMT_Plain_16);
-      display.setTextAlignment(TEXT_ALIGN_CENTER);
-      display.drawString(64, 25, "Waiting Data...");
-      if (strlen(rtcData.fetchStatus) > 0)
-      {
-        display.setFont(ArialMT_Plain_10);
-        display.drawString(64, 53, String(rtcData.fetchStatus));
-      }
-      display.display();
+      memset(&rtcData, 0, sizeof(PersistentData));
+      rtcData.magic = DATA_MAGIC;
+      rtcData.savedScreen = 0;
+      rtcData.screenTimeoutMs = 6000;
+      rtcData.nightMode = false;
     }
-  }
-  else if (rtcData.savedScreen == 1)
-  {
-    drawClockScreen(local_display_time, rtcData.lastBatteryVoltage);
-  }
-  else if (rtcData.savedScreen == 2)
-  {
-    drawWeatherScreen(local_display_time);
+    preferences.end();
   }
 }
 
-// --- SCREEN 1: GLUCOSE ---
+void drawRetroText(int startX, int startY, String text, int scale)
+{
+  for (int i = 0; i < text.length(); i++)
+  {
+    char c = text.charAt(i);
+    if (c >= 32 && c <= 126)
+    {
+      int idx = c - 32;
+      for (int col = 0; col < 5; col++)
+      {
+        uint8_t line = font5x7[idx][col];
+        for (int row = 0; row < 7; row++)
+        {
+          if (line & (1 << row))
+          {
+            display.fillRect(startX + col * scale, startY + row * scale, scale, scale);
+          }
+        }
+      }
+    }
+    startX += 6 * scale;
+  }
+}
+
+int getRetroTextWidth(String text, int scale)
+{
+  return text.length() * 6 * scale;
+}
+
+void drawChunkyIcon(int startX, int startY, const uint8_t *icon)
+{
+  for (int row = 0; row < 16; row++)
+  {
+    uint8_t b1 = pgm_read_byte(&icon[row * 2]);
+    uint8_t b2 = pgm_read_byte(&icon[row * 2 + 1]);
+    uint16_t line = b1 | (b2 << 8);
+    for (int col = 0; col < 16; col++)
+    {
+      if (line & (1 << col))
+      {
+        display.fillRect(startX + col * 2, startY + row * 2, 2, 2);
+      }
+    }
+  }
+}
+
+// --- SCREENS ---
 void drawGlucoseScreen(time_t datetimenow, String BG, int age, float batteryVoltage, String bgs0_direction, int delta)
 {
   display.clear();
   display.displayOn();
+
   int hour24 = hour(datetimenow);
   String timeNow = (hour24 < 10 ? "0" : "") + String(hour24) + ":" + (minute(datetimenow) < 10 ? "0" : "") + String(minute(datetimenow));
 
-  display.setFont(ArialMT_Plain_10);
-  display.setTextAlignment(TEXT_ALIGN_LEFT);
-  display.drawString(2, 3, timeNow);
-  display.setTextAlignment(TEXT_ALIGN_RIGHT);
-  String ageStr = (age > 60) ? String(age) + "m !" : String(age) + " min";
-  display.drawString(126, 3, ageStr);
+  if (deviceConnected)
+  {
+    drawRetroText(2, 4, "CONN", 1);
+  }
+  else
+  {
+    drawRetroText(2, 4, timeNow, 1);
+  }
 
-  display.setFont(ArialMT_Plain_24);
-  display.setTextAlignment(TEXT_ALIGN_CENTER);
-  display.drawString(45, 19, BG);
-  display.drawString(46, 19, BG);
+  String ageStr = (age > 60) ? String(age) + "m !" : String(age) + " min";
+  int ageW = getRetroTextWidth(ageStr, 1);
+  drawRetroText(126 - ageW, 4, ageStr, 1);
+
+  int bgW = getRetroTextWidth(BG, 3);
+  drawRetroText(45 - (bgW / 2), 22, BG, 3);
 
   if (bgs0_direction == "Flat")
     display.drawXbm(101, 26, 16, 16, ArrowSide);
@@ -215,45 +249,53 @@ void drawGlucoseScreen(time_t datetimenow, String BG, int age, float batteryVolt
   else if (bgs0_direction == "DoubleDown")
     display.drawXbm(101, 26, 16, 16, ArrowDownD);
 
-  display.setFont(ArialMT_Plain_10);
-  display.setTextAlignment(TEXT_ALIGN_LEFT);
-  int batPercent = getBatteryPercentage(batteryVoltage);
-  display.drawString(2, 50, "Bat: " + String(batPercent) + "%");
-  display.setTextAlignment(TEXT_ALIGN_RIGHT);
+  String batStr = "Bat: " + String(getBatteryPercentage(batteryVoltage)) + "%";
+  drawRetroText(2, 53, batStr, 1);
+
   String bgdelta = (delta > 0) ? "+" + String(delta) : String(delta);
-  display.drawString(126, 50, bgdelta + " mg/dl ");
+  bgdelta += " mg/dl";
+  int deltaW = getRetroTextWidth(bgdelta, 1);
+  drawRetroText(126 - deltaW, 53, bgdelta, 1);
 
   display.drawRect(0, 0, 128, 64);
   display.drawRect(0, 17, 128, 33);
   display.drawVerticalLine(90, 20, 27);
+
   display.display();
 }
 
-// --- SCREEN 2: CLOCK ---
 void drawClockScreen(time_t datetimenow, float batteryVoltage)
 {
   display.clear();
   display.displayOn();
+
+  String status = deviceConnected ? "CONN" : "BLE";
+  drawRetroText(0, 0, status, 1);
+
+  String bgStr = rtcData.hasLastData ? String(rtcData.lastBG) : "---";
+  int bgWidth = getRetroTextWidth(bgStr, 1);
+  drawRetroText(64 - (bgWidth / 2), 0, bgStr, 1);
+
+  String batStr = String(getBatteryPercentage(batteryVoltage)) + "%";
+  int batWidth = getRetroTextWidth(batStr, 1);
+  drawRetroText(128 - batWidth, 0, batStr, 1);
+
+  display.drawHorizontalLine(0, 9, 128);
+
   String timeStr = (hour(datetimenow) < 10 ? "0" : "") + String(hour(datetimenow)) + ":" + (minute(datetimenow) < 10 ? "0" : "") + String(minute(datetimenow));
+  int timeWidth = getRetroTextWidth(timeStr, 3);
+  drawRetroText(64 - (timeWidth / 2), 18, timeStr, 3);
 
-  display.setFont(ArialMT_Plain_24);
-  display.setTextAlignment(TEXT_ALIGN_CENTER);
-  display.drawString(64, 15, timeStr);
-  display.drawString(65, 15, timeStr);
+  int wd = weekday(datetimenow) - 1;
+  int mo = month(datetimenow);
+  String dateStr = String(_DOW_NAMES[wd]) + " " + String(_MON_NAMES[mo]) + " " + String(day(datetimenow));
 
-  display.setFont(ArialMT_Plain_16);
-  String dateStr = String(day(datetimenow)) + "." + String(month(datetimenow)) + "." + String(year(datetimenow));
-  display.drawString(64, 45, dateStr);
+  int dateWidth = getRetroTextWidth(dateStr, 1);
+  drawRetroText(64 - (dateWidth / 2), 48, dateStr, 1);
 
-  display.setFont(ArialMT_Plain_10);
-  display.setTextAlignment(TEXT_ALIGN_RIGHT);
-  int batPercent = getBatteryPercentage(batteryVoltage);
-  display.drawString(126, 0, String(batPercent) + "%");
-  display.drawRect(0, 0, 128, 64);
   display.display();
 }
 
-// --- SCREEN 3: WEATHER ---
 void drawWeatherScreen(time_t datetimenow)
 {
   display.clear();
@@ -261,11 +303,9 @@ void drawWeatherScreen(time_t datetimenow)
 
   if (!rtcData.hasWeatherData)
   {
-    display.setFont(ArialMT_Plain_10);
-    display.setTextAlignment(TEXT_ALIGN_CENTER);
-    display.drawString(64, 25, "Waiting Weather...");
-    if (strlen(rtcData.fetchStatus) > 0)
-      display.drawString(64, 38, String(rtcData.fetchStatus));
+    String msg = "No Weather Data";
+    int w = getRetroTextWidth(msg, 1);
+    drawRetroText(64 - (w / 2), 25, msg, 1);
     display.display();
     return;
   }
@@ -276,345 +316,372 @@ void drawWeatherScreen(time_t datetimenow)
     weatherDayOffset = 4;
 
   time_t forecastTime = rtcData.weatherDates[weatherDayOffset];
-  adjustTimezone(forecastTime); // Переводимо дату прогнозу в локальний час
+  adjustTimezone(forecastTime);
 
-  String dateStr = String(day(forecastTime)) + "/" + String(month(forecastTime));
+  int wd = weekday(forecastTime) - 1;
+  int mo = month(forecastTime);
+  String dateStr = String(_DOW_NAMES[wd]) + " " + String(_MON_NAMES[mo]) + " " + String(day(forecastTime));
+
+  String headerStr = "Lviv: " + dateStr;
   if (weatherDayOffset == 0)
-    dateStr = "Today";
-  if (weatherDayOffset == 1)
-    dateStr = "Tomorrow";
+    headerStr = "Today: " + dateStr;
 
-  display.setFont(ArialMT_Plain_10);
-  display.setTextAlignment(TEXT_ALIGN_CENTER);
-  display.drawString(64, 0, "Lviv: " + dateStr);
+  int headerW = getRetroTextWidth(headerStr, 1);
+  drawRetroText(64 - (headerW / 2), 2, headerStr, 1);
 
-  display.setFont(ArialMT_Plain_24);
-  String tempStr = String((int)rtcData.tempMax[weatherDayOffset]) + " / " + String((int)rtcData.tempMin[weatherDayOffset]);
-  display.drawString(64, 12, tempStr);
+  String tempStr = String((int)rtcData.tempMax[weatherDayOffset]) + "/" + String((int)rtcData.tempMin[weatherDayOffset]);
+  int tempW = getRetroTextWidth(tempStr, 2);
+  drawRetroText(64 - (tempW / 2), 14, tempStr, 2);
 
   int code = rtcData.weatherCodes[weatherDayOffset];
-  const unsigned char *weatherIcon = IconCloud;
+  const uint8_t *weatherIcon = W_Cloud;
 
   if (code == 0)
-    weatherIcon = IconSun;
+    weatherIcon = W_Sun;
   else if (code >= 1 && code <= 3)
-    weatherIcon = IconCloud;
+    weatherIcon = W_Cloud;
   else if (code == 45 || code == 48)
-    weatherIcon = IconCloud;
+    weatherIcon = W_Cloud;
   else if ((code >= 51 && code <= 67) || (code >= 80 && code <= 82))
-    weatherIcon = IconRain;
+    weatherIcon = W_Rain;
   else if (code >= 71 && code <= 77)
-    weatherIcon = IconSnow;
+    weatherIcon = W_Snow;
   else if (code >= 95)
-    weatherIcon = IconThunder;
+    weatherIcon = W_Thunder;
 
-  display.drawXbm(48, 36, 32, 32, weatherIcon);
+  drawChunkyIcon(48, 30, weatherIcon);
 
-  display.setFont(ArialMT_Plain_10);
   if (weatherDayOffset > 0)
-    display.drawString(10, 25, "<");
+  {
+    drawRetroText(8, 42, "<", 1);
+  }
   if (weatherDayOffset < 4)
-    display.drawString(118, 25, ">");
+  {
+    drawRetroText(114, 42, ">", 1);
+  }
 
-  display.drawRect(0, 0, 128, 64);
   display.display();
 }
 
-// --- DATA MANAGEMENT FUNCTIONS ---
-void backupDataToFlash()
+void drawGraphScreen(time_t datetimenow)
 {
-  Serial.println("Backing up data to Flash...");
-  preferences.begin("glucose_data", false);
-  preferences.putBytes("data", &rtcData, sizeof(PersistentData));
-  preferences.end();
-  Serial.println("Backup complete.");
-}
+  display.clear();
+  display.displayOn();
 
-void initDataManagement()
-{
-  if (rtcData.magic != DATA_MAGIC)
+  drawRetroText(2, 2, "HISTORY", 1);
+  String currBg = rtcData.hasLastData ? String(rtcData.lastBG) : "---";
+  int w = getRetroTextWidth(currBg, 1);
+  drawRetroText(126 - w, 2, currBg, 1);
+
+  display.drawHorizontalLine(0, 11, 128);
+
+  // Пунктирні лінії цільового діапазону (180 і 70)
+  for (int x = 0; x < 128; x += 4)
   {
-    Serial.println("Data invalid/corrupted. Trying to restore from Flash...");
-    preferences.begin("glucose_data", true);
-    if (preferences.isKey("data"))
+    display.setPixel(x, 29); // 180 mg/dl (10.0 mmol/L)
+    display.setPixel(x, 55); // 70 mg/dl (3.9 mmol/L)
+  }
+
+  // Малювання історії: крапки замість ліній
+  for (int i = 0; i < 64; i++)
+  {
+    if (rtcData.bgHistory[i] > 0)
     {
-      preferences.getBytes("data", &rtcData, sizeof(PersistentData));
-      Serial.println("Data restored from Flash successfully!");
-      rtcData.magic = DATA_MAGIC;
-    }
-    else
-    {
-      Serial.println("No backup found. Clean start.");
-      memset(&rtcData, 0, sizeof(PersistentData));
-      rtcData.magic = DATA_MAGIC;
-      rtcData.savedScreen = 0;
-    }
-    preferences.end();
-  }
-  else
-  {
-    Serial.println("Warm Boot: RAM Data is valid.");
-  }
-}
+      int bg = rtcData.bgHistory[i];
+      // Обмежуємо значення, щоб вони не вилізали за екран
+      if (bg > 250)
+        bg = 250;
+      if (bg < 40)
+        bg = 40;
 
-// --- NETWORK CONNECTION ---
-bool connectToWiFi()
-{
-  Serial.print("Connecting to WIFI... ");
-  strcpy(rtcData.fetchStatus, "WiFi Init...");
+      int x = i * 2;
+      // Маппінг значення на висоту екрана
+      int y = 63 - ((bg - 40) * 51 / 210);
 
-  WiFi.disconnect(true);
-  WiFi.mode(WIFI_OFF);
-  delay(200);
-
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
-  esp_wifi_set_ps(WIFI_PS_NONE);
-  WiFi.setTxPower(WIFI_POWER_19_5dBm);
-  WiFi.persistent(false);
-
-  WiFi.begin(ssid, password);
-
-  int connectAttempts = 0;
-  while (WiFi.status() != WL_CONNECTED && connectAttempts < 24)
-  {
-    Serial.print(".");
-    delay(500);
-    connectAttempts++;
-  }
-
-  if (WiFi.status() == WL_CONNECTED)
-  {
-    Serial.println("\nConnected! IP: " + WiFi.localIP().toString());
-    strcpy(rtcData.fetchStatus, "WiFi OK");
-    rtcData.failedConnectionCount = 0;
-    return true;
-  }
-  else
-  {
-    Serial.println("\nFailed to connect.");
-    strcpy(rtcData.fetchStatus, "WiFi Fail");
-    rtcData.failedConnectionCount++;
-    if (rtcData.failedConnectionCount < 3)
-      ESP.restart();
-    else
-      rtcData.failedConnectionCount = 0;
-    return false;
-  }
-}
-
-// --- GET READINGS ---
-bool getreadings()
-{
-  WiFiClient client;
-  client.setTimeout(8000);
-
-  strcpy(rtcData.fetchStatus, "Conn NS...");
-  if (!client.connect(WiFi.gatewayIP(), httpPort))
-  {
-    strcpy(rtcData.fetchStatus, "NS Conn Err");
-    client.stop();
-    return false;
-  }
-
-  client.print(String("GET /pebble HTTP/1.0\r\nHost: ") + WiFi.gatewayIP().toString() + "\r\nConnection: close\r\n\r\n");
-
-  unsigned long timeout = millis();
-  while (client.available() == 0)
-  {
-    if (millis() - timeout > 8000)
-    {
-      strcpy(rtcData.fetchStatus, "NS Timeout");
-      client.stop();
-      return false;
-    }
-    delay(10);
-  }
-
-  if (!client.find("\r\n\r\n"))
-  {
-    strcpy(rtcData.fetchStatus, "Inv Header");
-    client.stop();
-    return false;
-  }
-
-  DynamicJsonDocument doc(3000);
-  DeserializationError error = deserializeJson(doc, client);
-
-  if (error || !doc.containsKey("status") || !doc.containsKey("bgs"))
-  {
-    strcpy(rtcData.fetchStatus, "Data Err");
-    client.stop();
-    return false;
-  }
-
-  String status0_now_str = doc["status"][0]["now"].as<String>();
-  if (status0_now_str.length() > 3)
-    status0_now_str = status0_now_str.substring(0, status0_now_str.length() - 3);
-  time_t status0_now1 = status0_now_str.toInt(); // Отримуємо чистий UTC
-
-  JsonObject bgs0 = doc["bgs"][0];
-
-  String bgs_datetime_str = bgs0["datetime"].as<String>();
-  time_t bgs0_datetime2;
-  if (bgs_datetime_str.length() >= 10)
-    bgs0_datetime2 = bgs_datetime_str.substring(0, 10).toInt();
-  else
-    bgs0_datetime2 = status0_now1; // Отримуємо чистий UTC
-
-  // Встановлюємо системний час чистим UTC
-  struct timeval tv = {.tv_sec = status0_now1};
-  settimeofday(&tv, NULL);
-  setTime(status0_now1);
-
-  strncpy(rtcData.lastBG, bgs0["sgv"], sizeof(rtcData.lastBG) - 1);
-  strncpy(rtcData.lastDirection, bgs0["direction"], sizeof(rtcData.lastDirection) - 1);
-  rtcData.lastDelta = bgs0["bgdelta"];
-  rtcData.lastBGSDateTime = bgs0_datetime2; // Зберігаємо як UTC
-  rtcData.hasLastData = true;
-
-  struct timeval tv_now_check;
-  gettimeofday(&tv_now_check, NULL);
-  rtcData.lastSuccessfulFetchTime = tv_now_check.tv_sec;
-  rtcData.lastBatteryVoltage = getBatteryVoltage();
-  strcpy(rtcData.fetchStatus, "");
-
-  Serial.println("Glucose success!");
-  backupDataToFlash();
-
-  client.stop();
-  return true;
-}
-
-// --- SYNC NTP ---
-bool syncTimeNTP()
-{
-  configTzTime(tzInfo, ntpServer);
-  struct tm timeinfo;
-  return getLocalTime(&timeinfo, 5000);
-}
-
-// --- GET WEATHER ---
-bool getWeather()
-{
-  WiFiClient client;
-  client.setTimeout(15000);
-
-  if (!client.connect(weatherHost, weatherPort))
-  {
-    client.stop();
-    return false;
-  }
-
-  String url = "/v1/forecast?latitude=49.84&longitude=24.03&daily=weathercode,temperature_2m_max,temperature_2m_min&timezone=auto";
-  client.print(String("GET ") + url + " HTTP/1.0\r\nHost: " + weatherHost + "\r\nConnection: close\r\n\r\n");
-
-  unsigned long timeout = millis();
-  while (client.available() == 0)
-  {
-    if (millis() - timeout > 15000)
-    {
-      client.stop();
-      return false;
+      // Малюємо чітку крапку (2x2 пікселі)
+      display.fillRect(x, y, 2, 2);
     }
   }
+  display.display();
+}
 
-  if (!client.find("\r\n\r\n"))
-  {
-    client.stop();
-    return false;
-  }
-
-  StaticJsonDocument<200> filter;
-  filter["daily"]["weathercode"] = true;
-  filter["daily"]["temperature_2m_max"] = true;
-  filter["daily"]["temperature_2m_min"] = true;
-
-  DynamicJsonDocument doc(3072);
-  DeserializationError error = deserializeJson(doc, client, DeserializationOption::Filter(filter));
-
-  if (error || !doc.containsKey("daily"))
-  {
-    client.stop();
-    return false;
-  }
-
-  JsonArray daily_code = doc["daily"]["weathercode"];
-  JsonArray daily_max = doc["daily"]["temperature_2m_max"];
-  JsonArray daily_min = doc["daily"]["temperature_2m_min"];
-
-  if (daily_code.size() == 0)
-  {
-    client.stop();
-    return false;
-  }
-
+void updateDisplay()
+{
   struct timeval tv_now;
   gettimeofday(&tv_now, NULL);
+  time_t current_rtc_time = tv_now.tv_sec;
 
-  for (int i = 0; i < 5; i++)
+  time_t local_display_time = current_rtc_time;
+  adjustTimezone(local_display_time);
+  setTime(local_display_time);
+
+  if (rtcData.nightMode)
+    display.invertDisplay();
+  else
+    display.normalDisplay();
+
+  if (rtcData.savedScreen == 0)
   {
-    rtcData.weatherCodes[i] = daily_code[i];
-    rtcData.tempMax[i] = daily_max[i];
-    rtcData.tempMin[i] = daily_min[i];
-    rtcData.weatherDates[i] = tv_now.tv_sec + (i * 86400); // Зберігаємо як UTC
-  }
-
-  rtcData.hasWeatherData = true;
-  rtcData.lastWeatherFetchTime = tv_now.tv_sec;
-
-  backupDataToFlash();
-
-  client.stop();
-  return true;
-}
-
-// --- Wi-Fi Task ---
-void wifiTask(void *parameter)
-{
-  if (connectToWiFi())
-  {
-    dataFetchedSuccessfully = getreadings();
-    if (!dataFetchedSuccessfully)
+    if (rtcData.hasLastData)
     {
-      delay(2000);
-      dataFetchedSuccessfully = getreadings();
-    }
-    if (!dataFetchedSuccessfully)
-    {
-      syncTimeNTP();
-      rtcData.lastSuccessfulFetchTime = 0;
-    }
-
-    struct timeval tv_now;
-    gettimeofday(&tv_now, NULL);
-    if (!rtcData.hasWeatherData || (tv_now.tv_sec - rtcData.lastWeatherFetchTime > 3600))
-    {
-      delay(100);
-      weatherFetchedSuccessfully = getWeather();
+      int current_data_age = (current_rtc_time - rtcData.lastBGSDateTime) / 60;
+      if (current_data_age < 0)
+        current_data_age = 0;
+      drawGlucoseScreen(local_display_time, String(rtcData.lastBG), current_data_age, rtcData.lastBatteryVoltage, String(rtcData.lastDirection), rtcData.lastDelta);
     }
     else
     {
-      weatherFetchedSuccessfully = true;
+      display.clear();
+      display.displayOn();
+      String waitMsg = "Waiting BLE...";
+      int waitW = getRetroTextWidth(waitMsg, 1);
+      drawRetroText(64 - (waitW / 2), 25, waitMsg, 1);
+      if (strlen(rtcData.fetchStatus) > 0)
+      {
+        int statW = getRetroTextWidth(String(rtcData.fetchStatus), 1);
+        drawRetroText(64 - (statW / 2), 53, String(rtcData.fetchStatus), 1);
+      }
+      if (deviceConnected)
+      {
+        String connMsg = "[CONNECTED]";
+        int connW = getRetroTextWidth(connMsg, 1);
+        drawRetroText(64 - (connW / 2), 10, connMsg, 1);
+      }
+      display.display();
     }
-
-    WiFi.disconnect(true);
-    WiFi.mode(WIFI_OFF);
-    delay(100);
   }
-  wifiTaskComplete = true;
-  vTaskDelete(NULL);
+  else if (rtcData.savedScreen == 1)
+  {
+    drawClockScreen(local_display_time, rtcData.lastBatteryVoltage);
+  }
+  else if (rtcData.savedScreen == 2)
+  {
+    drawWeatherScreen(local_display_time);
+  }
+  else if (rtcData.savedScreen == 3)
+  {
+    drawGraphScreen(local_display_time);
+  }
 }
 
-int getBatteryPercentage(float voltage)
+// --- NATIVE BLE CALLBACKS ---
+class ServerCallbacks : public BLEServerCallbacks
 {
-  const float minV = 3.3;
-  const float maxV = 4.2;
-  if (voltage >= maxV)
-    return 100;
-  if (voltage <= minV)
-    return 0;
-  return (int)((voltage - minV) / (maxV - minV) * 100.0);
+  void onConnect(BLEServer *pServer)
+  {
+    deviceConnected = true;
+    screenNeedsUpdate = true;
+    Serial.println("Телефон ПІДКЛЮЧИВСЯ!");
+  }
+  void onDisconnect(BLEServer *pServer)
+  {
+    deviceConnected = false;
+    screenNeedsUpdate = true;
+    Serial.println("Телефон ВІД'ЄДНАВСЯ!");
+  }
+};
+
+class DataCallbacks : public BLECharacteristicCallbacks
+{
+  void onWrite(BLECharacteristic *pCharacteristic)
+  {
+    std::string rxValue = pCharacteristic->getValue();
+    String payload = "";
+    for (int i = 0; i < rxValue.length(); i++)
+    {
+      payload += rxValue[i];
+    }
+    payload.trim();
+    Serial.println("ОТРИМАНО ДАНІ: " + payload);
+
+    String values[20];
+    int count = 0, startIndex = 0;
+    int commaIndex = payload.indexOf(',');
+
+    while (commaIndex != -1 && count < 20)
+    {
+      values[count] = payload.substring(startIndex, commaIndex);
+      values[count].trim();
+      count++;
+      startIndex = commaIndex + 1;
+      commaIndex = payload.indexOf(',', startIndex);
+    }
+    if (startIndex < payload.length() && count < 20)
+    {
+      values[count] = payload.substring(startIndex);
+      values[count].trim();
+      count++;
+    }
+
+    if (count >= 4)
+    {
+      int newTime = values[3].toInt();
+
+      // НОВЕ: Авто-визначення mmol/L чи mg/dl для графіка
+      float rawBg = values[0].toFloat();
+      // Якщо значення менше 30, значить це mmol/L. Множимо на 18 для правильного масштабу графіка
+      int graphBg = (rawBg < 30.0) ? (int)(rawBg * 18.0) : (int)rawBg;
+
+      if (newTime != rtcData.lastBGSDateTime && rtcData.lastBGSDateTime != 0)
+      {
+        for (int i = 0; i < 63; i++)
+        {
+          rtcData.bgHistory[i] = rtcData.bgHistory[i + 1];
+        }
+        rtcData.bgHistory[63] = graphBg;
+      }
+      else if (rtcData.lastBGSDateTime == 0)
+      {
+        rtcData.bgHistory[63] = graphBg; // Перший запис
+      }
+
+      strncpy(rtcData.lastBG, values[0].c_str(), sizeof(rtcData.lastBG) - 1);
+      rtcData.lastBG[sizeof(rtcData.lastBG) - 1] = '\0';
+
+      strncpy(rtcData.lastDirection, values[1].c_str(), sizeof(rtcData.lastDirection) - 1);
+      rtcData.lastDirection[sizeof(rtcData.lastDirection) - 1] = '\0';
+
+      rtcData.lastDelta = values[2].toInt();
+      rtcData.lastBGSDateTime = newTime;
+      rtcData.hasLastData = true;
+
+      rtcData.lastSuccessfulFetchTime = rtcData.lastBGSDateTime;
+      rtcData.lastBatteryVoltage = getBatteryVoltage();
+      strcpy(rtcData.fetchStatus, "BLE OK");
+
+      newDataReceived = true;
+    }
+
+    if (count >= 19)
+    {
+      for (int i = 0; i < 5; i++)
+      {
+        int baseIndex = 4 + (i * 3);
+        rtcData.weatherCodes[i] = values[baseIndex].toInt();
+        rtcData.tempMax[i] = values[baseIndex + 1].toFloat();
+        rtcData.tempMin[i] = values[baseIndex + 2].toFloat();
+        rtcData.weatherDates[i] = rtcData.lastBGSDateTime + (i * 86400);
+      }
+      rtcData.hasWeatherData = true;
+      rtcData.lastWeatherFetchTime = rtcData.lastBGSDateTime;
+    }
+
+    if (count >= 4)
+    {
+      backupDataToFlash();
+    }
+  }
+};
+
+class SettingsCallbacks : public BLECharacteristicCallbacks
+{
+  void onWrite(BLECharacteristic *pCharacteristic)
+  {
+    std::string rxValue = pCharacteristic->getValue();
+    String payload = "";
+    for (int i = 0; i < rxValue.length(); i++)
+    {
+      payload += rxValue[i];
+    }
+    payload.trim();
+    Serial.println("ОТРИМАНО НАЛАШТУВАННЯ: " + payload);
+
+    if (payload.startsWith("TIME:"))
+    {
+      time_t newTime = payload.substring(5).toInt();
+      if (newTime > 0)
+      {
+        struct timeval tv = {.tv_sec = newTime};
+        settimeofday(&tv, NULL);
+        setTime(newTime);
+        Serial.println("Час оновлено вручну!");
+        newDataReceived = true;
+      }
+    }
+    else if (payload.startsWith("CONF:"))
+    {
+      if (payload.indexOf("TIMEOUT=") != -1)
+      {
+        int tIndex = payload.indexOf("TIMEOUT=") + 8;
+        int tEnd = payload.indexOf(";", tIndex);
+        if (tEnd == -1)
+          tEnd = payload.length();
+        int sec = payload.substring(tIndex, tEnd).toInt();
+        if (sec >= 5 && sec <= 60)
+          rtcData.screenTimeoutMs = sec * 1000;
+      }
+      if (payload.indexOf("NIGHT=") != -1)
+      {
+        int nIndex = payload.indexOf("NIGHT=") + 6;
+        char nVal = payload.charAt(nIndex);
+        rtcData.nightMode = (nVal == '1');
+      }
+      backupDataToFlash();
+      newDataReceived = true;
+    }
+  }
+};
+
+// --- ФОНОВА ЗАДАЧА NATIVE BLE ---
+void bleTask(void *parameter)
+{
+  BLEDevice::init("GlucoWatch_ESP");
+  BLEDevice::setMTU(256);
+
+  BLEServer *pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new ServerCallbacks());
+
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+
+  BLECharacteristic *pDataChar = pService->createCharacteristic(
+      DATA_CHAR_UUID,
+      BLECharacteristic::PROPERTY_WRITE);
+  pDataChar->setCallbacks(new DataCallbacks());
+
+  BLECharacteristic *pSetChar = pService->createCharacteristic(
+      SETTINGS_CHAR_UUID,
+      BLECharacteristic::PROPERTY_WRITE);
+  pSetChar->setCallbacks(new SettingsCallbacks());
+
+  pService->start();
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  BLEDevice::startAdvertising();
+
+  unsigned long startTime = millis();
+  unsigned long absoluteStart = millis();
+
+  while (true)
+  {
+    if (millis() - absoluteStart > 60000)
+    {
+      if (!newDataReceived)
+        strcpy(rtcData.fetchStatus, "BLE Stuck");
+      break;
+    }
+
+    if (deviceConnected)
+    {
+      startTime = millis();
+    }
+    else
+    {
+      if (newDataReceived)
+        break;
+
+      if (millis() - startTime > 45000)
+      {
+        strcpy(rtcData.fetchStatus, "BLE Timeout");
+        break;
+      }
+    }
+    delay(100);
+  }
+
+  BLEDevice::deinit(true);
+  bleTaskComplete = true;
+  vTaskDelete(NULL);
 }
 
 // --- SETUP ---
@@ -624,12 +691,9 @@ void setup()
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
   Serial.begin(115200);
 
-  // Налаштовуємо глобальне середовище для роботи з часом
   setenv("TZ", tzInfo, 1);
   tzset();
-
   initDataManagement();
-
   rtcData.lastBatteryVoltage = getBatteryVoltage();
 
   pinMode(BUTTON_LEFT_PIN, INPUT_PULLUP);
@@ -640,15 +704,15 @@ void setup()
   display.init();
   display.flipScreenVertically();
   display.setContrast(100);
-  display.clear();
 
   esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
   struct timeval tv_now;
   gettimeofday(&tv_now, NULL);
   time_t current_rtc_time = tv_now.tv_sec;
 
-  bool wokeByTimer = (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER) || (wakeup_reason == ESP_SLEEP_WAKEUP_UNDEFINED);
+  bool wokeByTimer = (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER);
   bool wokeByButton = (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0);
+  bool coldBoot = (wakeup_reason == ESP_SLEEP_WAKEUP_UNDEFINED);
 
   long time_since_last_fetch;
   if (rtcData.lastSuccessfulFetchTime == 0)
@@ -661,33 +725,39 @@ void setup()
   else
     time_since_last_fetch = current_rtc_time - rtcData.lastSuccessfulFetchTime;
 
-  bool needsUpdate = wokeByTimer || wokeByButton || (time_since_last_fetch >= 300);
-
-  if (wokeByButton && rtcData.failedConnectionCount > 0)
-    needsUpdate = false;
+  bool needsUpdate = wokeByTimer || coldBoot || wokeByButton || (time_since_last_fetch >= 300);
 
   if (needsUpdate)
   {
-    wifiTaskComplete = false;
-    dataFetchedSuccessfully = false;
-    weatherFetchedSuccessfully = false;
-    xTaskCreatePinnedToCore(wifiTask, "WiFiTask", 10000, NULL, 1, NULL, 0);
+    bleTaskComplete = false;
+    xTaskCreatePinnedToCore(bleTask, "BLETask", 10000, NULL, 1, NULL, 0);
+  }
+  else
+  {
+    bleTaskComplete = true;
   }
 
-  if (wokeByButton)
+  if (wokeByButton || coldBoot)
   {
     updateDisplay();
-    while (digitalRead(BUTTON_RIGHT_PIN) == LOW)
-      delay(50);
-    delay(100);
+
+    if (wokeByButton)
+    {
+      while (digitalRead(BUTTON_RIGHT_PIN) == LOW)
+        delay(50);
+      delay(100);
+    }
 
     unsigned long lastInputTime = millis();
-    while (millis() - lastInputTime < INTERACTIVE_TIMEOUT_MS)
+    int currentTimeout = (rtcData.screenTimeoutMs > 0) ? rtcData.screenTimeoutMs : 6000;
+    bool screenRefreshedByBLE = false;
+
+    while (millis() - lastInputTime < currentTimeout)
     {
       if (digitalRead(BUTTON_LEFT_PIN) == LOW)
       {
         rtcData.savedScreen++;
-        if (rtcData.savedScreen > 2)
+        if (rtcData.savedScreen > 3)
           rtcData.savedScreen = 0;
         weatherDayOffset = 0;
         updateDisplay();
@@ -698,7 +768,7 @@ void setup()
       {
         rtcData.savedScreen--;
         if (rtcData.savedScreen < 0)
-          rtcData.savedScreen = 2;
+          rtcData.savedScreen = 3;
         weatherDayOffset = 0;
         updateDisplay();
         lastInputTime = millis();
@@ -724,11 +794,18 @@ void setup()
         }
       }
 
-      if (needsUpdate && wifiTaskComplete)
+      if (screenNeedsUpdate)
       {
         updateDisplay();
-        needsUpdate = false;
+        screenNeedsUpdate = false;
       }
+
+      if (newDataReceived && !screenRefreshedByBLE)
+      {
+        updateDisplay();
+        screenRefreshedByBLE = true;
+      }
+
       delay(20);
     }
     display.displayOff();
@@ -736,10 +813,13 @@ void setup()
   else
   {
     unsigned long startWait = millis();
-    while (!wifiTaskComplete && millis() - startWait < 30000)
+    while (!bleTaskComplete && millis() - startWait < 45000)
     {
-      if (digitalRead(BUTTON_LEFT_PIN) == LOW || digitalRead(BUTTON_RIGHT_PIN) == LOW)
+      if (digitalRead(BUTTON_RIGHT_PIN) == LOW || digitalRead(BUTTON_LEFT_PIN) == LOW)
+      {
+        updateDisplay();
         break;
+      }
       delay(10);
     }
   }
@@ -749,13 +829,10 @@ void setup()
   long new_time_since = (rtcData.lastSuccessfulFetchTime == 0) ? 300 : (current_rtc_time - rtcData.lastSuccessfulFetchTime);
   if (new_time_since < 0 || new_time_since >= 300)
     new_time_since = 0;
+
   long remaining = 300 - new_time_since;
   if (remaining <= 0)
     remaining = 300;
-
-  Serial.print("Sleep: ");
-  Serial.println(remaining);
-  Serial.flush();
 
   esp_sleep_enable_timer_wakeup(remaining * 1000000ULL);
   esp_sleep_enable_ext0_wakeup(BUTTON_RIGHT_PIN, 0);
