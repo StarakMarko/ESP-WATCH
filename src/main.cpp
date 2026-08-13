@@ -11,6 +11,7 @@
 #include <BLEDevice.h>
 #include <BLEUtils.h>
 #include <BLEServer.h>
+#include "esp_bt.h" // НОВЕ: Для керування потужністю антени
 
 // --- !!! ЗАХИСТ ВІД ПЕРЕЗАВАНТАЖЕНЬ !!! ---
 #include "soc/soc.h"
@@ -64,7 +65,7 @@ struct PersistentData
 };
 
 RTC_DATA_ATTR PersistentData rtcData;
-#define DATA_MAGIC 0xBEEF0003 // Оновлено для очищення історії після оновлення алгоритму
+#define DATA_MAGIC 0xBEEF0003
 Preferences preferences;
 
 // --- СТАТУСИ ---
@@ -377,6 +378,7 @@ void drawGraphScreen(time_t datetimenow)
   drawRetroText(0, 24, "10.0", 1);
   drawRetroText(6, 45, "3.9", 1);
 
+  // Пунктирні лінії цільового діапазону
   for (int x = 26; x < 128; x += 4)
   {
     display.setPixel(x, 27);
@@ -388,7 +390,7 @@ void drawGraphScreen(time_t datetimenow)
   if (rtcData.hasLastData && rtcData.lastBGSDateTime > 0)
   {
     baseTime = rtcData.lastBGSDateTime;
-    adjustTimezone(baseTime);
+    adjustTimezone(baseTime); // ВИПРАВЛЕНО ЧАСОВИЙ ПОЯС ДЛЯ ГРАФІКА
   }
 
   int currentMin = minute(baseTime);
@@ -423,6 +425,7 @@ void drawGraphScreen(time_t datetimenow)
     }
   }
 
+  // Малювання історії
   for (int i = 0; i < 64; i++)
   {
     if (rtcData.bgHistory[i] > 0)
@@ -584,7 +587,7 @@ class DataCallbacks : public BLECharacteristicCallbacks
           }
           for (int i = 64 - shiftSlots; i < 63; i++)
           {
-            rtcData.bgHistory[i] = 0; // Заповнення дірок
+            rtcData.bgHistory[i] = 0;
           }
           rtcData.bgHistory[63] = graphBg;
         }
@@ -677,10 +680,15 @@ class SettingsCallbacks : public BLECharacteristicCallbacks
   }
 };
 
-// --- ФОНОВА ЗАДАЧА NATIVE BLE ---
+// --- ФОНОВА ЗАДАЧА NATIVE BLE (ЕКСТРЕМАЛЬНЕ ЕНЕРГОЗБЕРЕЖЕННЯ) ---
 void bleTask(void *parameter)
 {
   BLEDevice::init("GlucoWatch_ESP");
+
+  // НОВЕ: Знижуємо потужність антени до мінімуму для збереження батареї
+  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, ESP_PWR_LVL_N12);
+  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, ESP_PWR_LVL_N12);
+
   BLEDevice::setMTU(256);
 
   BLEServer *pServer = BLEDevice::createServer();
@@ -704,34 +712,27 @@ void bleTask(void *parameter)
   pAdvertising->setScanResponse(true);
   BLEDevice::startAdvertising();
 
-  unsigned long startTime = millis();
   unsigned long absoluteStart = millis();
 
+  // НОВЕ: Жорсткий ліміт очікування BLE (рівно 10 секунд)
   while (true)
   {
-    if (millis() - absoluteStart > 60000)
+    if (millis() - absoluteStart > 10000)
     {
       if (!newDataReceived)
-        strcpy(rtcData.fetchStatus, "BLE Stuck");
+        strcpy(rtcData.fetchStatus, "BLE Sleep");
       break;
     }
 
-    if (deviceConnected)
+    if (deviceConnected && (millis() - absoluteStart > 13000))
     {
-      startTime = millis();
+      break;
     }
-    else
-    {
-      if (newDataReceived)
-        break;
 
-      if (millis() - startTime > 45000)
-      {
-        strcpy(rtcData.fetchStatus, "BLE Timeout");
-        break;
-      }
-    }
-    delay(100);
+    if (newDataReceived)
+      break;
+
+    delay(50);
   }
 
   BLEDevice::deinit(true);
@@ -868,7 +869,7 @@ void setup()
   else
   {
     unsigned long startWait = millis();
-    while (!bleTaskComplete && millis() - startWait < 45000)
+    while (!bleTaskComplete && millis() - startWait < 11000)
     {
       if (digitalRead(BUTTON_RIGHT_PIN) == LOW || digitalRead(BUTTON_LEFT_PIN) == LOW)
       {
