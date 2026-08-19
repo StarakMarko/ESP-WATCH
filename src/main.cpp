@@ -11,7 +11,7 @@
 #include <BLEDevice.h>
 #include <BLEUtils.h>
 #include <BLEServer.h>
-#include "esp_bt.h" // НОВЕ: Для керування потужністю антени
+#include "esp_bt.h"
 
 // --- !!! ЗАХИСТ ВІД ПЕРЕЗАВАНТАЖЕНЬ !!! ---
 #include "soc/soc.h"
@@ -30,6 +30,8 @@ SSD1306Wire display(0x3c, I2C_SDA, I2C_SCL);
 #define BUTTON_NEXT_PIN GPIO_NUM_6
 #define BATTERY_PIN GPIO_NUM_8
 
+#define VIBE_PIN 7
+
 const float R1 = 67000.0;
 const float R2 = 67000.0;
 const float ADC_MAX_VOLTAGE = 3.3;
@@ -39,6 +41,18 @@ const int ADC_RESOLUTION = 4095;
 #define SERVICE_UUID "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define DATA_CHAR_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 #define SETTINGS_CHAR_UUID "a1b2c3d4-e5f6-7890-1234-56789abcdef0"
+
+// --- ДИНАМІЧНИЙ ПУЛ БУДИЛЬНИКІВ ---
+#define MAX_ALARMS 10
+
+struct AlarmDef
+{
+  int hour;
+  int minute;
+  uint8_t daysMask;
+  bool enabled;
+  int lastDay;
+};
 
 // --- СТРУКТУРА ДАНИХ ---
 struct PersistentData
@@ -62,10 +76,19 @@ struct PersistentData
   int savedScreen;
   int screenTimeoutMs;
   bool nightMode;
+
+  float targetMax;
+  float targetMin;
+
+  int graphHours;
+
+  AlarmDef alarms[MAX_ALARMS];
+  time_t snoozeTimestamp;
+  int snoozedAlarmIndex;
 };
 
 RTC_DATA_ATTR PersistentData rtcData;
-#define DATA_MAGIC 0xBEEF0003
+#define DATA_MAGIC 0xBEEF000C // Оновлено для чистої логіки без фаєрволу
 Preferences preferences;
 
 // --- СТАТУСИ ---
@@ -73,7 +96,9 @@ volatile bool bleTaskComplete = false;
 volatile bool newDataReceived = false;
 volatile bool deviceConnected = false;
 volatile bool screenNeedsUpdate = false;
+volatile bool needsVibration = false;
 int weatherDayOffset = 0;
+int alarmPageOffset = 0;
 
 // --- Bitmaps ---
 const unsigned char ArrowUp[] PROGMEM = {0x80, 0x00, 0xc0, 0x01, 0xe0, 0x03, 0xf0, 0x07, 0xf8, 0x0f, 0xfc, 0x1f, 0xde, 0x3d, 0xcf, 0x79, 0xc7, 0x71, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01};
@@ -84,18 +109,15 @@ const unsigned char ArrowSide[] PROGMEM = {0x80, 0x01, 0x80, 0x03, 0x80, 0x07, 0
 const unsigned char ArrowUpD[] PROGMEM = {0x08, 0x10, 0x1c, 0x38, 0x2a, 0x54, 0x49, 0x92, 0x88, 0x11, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10};
 const unsigned char ArrowDownD[] PROGMEM = {0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x08, 0x10, 0x88, 0x11, 0x49, 0x92, 0x2a, 0x54, 0x1c, 0x38, 0x08, 0x10};
 
-// --- 8-BIT WEATHER ICONS ---
 const uint8_t W_Sun[] PROGMEM = {0x80, 0x01, 0x80, 0x01, 0x00, 0x00, 0x04, 0x20, 0x28, 0x14, 0xc0, 0x03, 0x20, 0x04, 0x13, 0xc8, 0x13, 0xc8, 0x20, 0x04, 0xc0, 0x03, 0x28, 0x14, 0x04, 0x20, 0x00, 0x00, 0x80, 0x01, 0x80, 0x01};
 const uint8_t W_Cloud[] PROGMEM = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x03, 0xc0, 0x0f, 0xe0, 0x1f, 0xf0, 0x3f, 0xf8, 0x7f, 0xfc, 0xff, 0xfc, 0xff, 0xfc, 0xff, 0xf8, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
 const uint8_t W_Rain[] PROGMEM = {0x00, 0x00, 0x00, 0x00, 0x80, 0x03, 0xc0, 0x0f, 0xe0, 0x1f, 0xf0, 0x3f, 0xf8, 0x7f, 0xfc, 0xff, 0xfc, 0xff, 0xfc, 0xff, 0xf8, 0x7f, 0x00, 0x00, 0x24, 0x24, 0x12, 0x48, 0x24, 0x24, 0x12, 0x48};
 const uint8_t W_Snow[] PROGMEM = {0x00, 0x00, 0x00, 0x00, 0x80, 0x03, 0xc0, 0x0f, 0xe0, 0x1f, 0xf0, 0x3f, 0xf8, 0x7f, 0xfc, 0xff, 0xfc, 0xff, 0xfc, 0xff, 0xf8, 0x7f, 0x00, 0x00, 0x42, 0x42, 0x24, 0x24, 0x42, 0x42, 0x00, 0x00};
 const uint8_t W_Thunder[] PROGMEM = {0x00, 0x00, 0x00, 0x00, 0x80, 0x03, 0xc0, 0x0f, 0xe0, 0x1f, 0xf0, 0x3f, 0xf8, 0x7f, 0xfc, 0xff, 0xfc, 0xff, 0xfc, 0xff, 0xf8, 0x7f, 0x00, 0x00, 0x20, 0x04, 0x60, 0x0c, 0xc0, 0x03, 0x40, 0x01};
 
-// --- Масиви для екрана годинника ---
 const char *const _DOW_NAMES[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
 const char *const _MON_NAMES[] = {"", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
 
-// --- ПОВНА ТАБЛИЦЯ ASCII РЕТРО-ШРИФТУ 5x7 ---
 const uint8_t font5x7[95][5] PROGMEM = {
     {0x00, 0x00, 0x00, 0x00, 0x00}, {0x00, 0x00, 0x2f, 0x00, 0x00}, {0x00, 0x07, 0x00, 0x07, 0x00}, {0x14, 0x7f, 0x14, 0x7f, 0x14}, {0x24, 0x2a, 0x7f, 0x2a, 0x12}, {0x23, 0x13, 0x08, 0x64, 0x62}, {0x36, 0x49, 0x55, 0x22, 0x50}, {0x00, 0x05, 0x03, 0x00, 0x00}, {0x00, 0x1c, 0x22, 0x41, 0x00}, {0x00, 0x41, 0x22, 0x1c, 0x00}, {0x14, 0x08, 0x3e, 0x08, 0x14}, {0x08, 0x08, 0x3e, 0x08, 0x08}, {0x00, 0x00, 0x50, 0x30, 0x00}, {0x08, 0x08, 0x08, 0x08, 0x08}, {0x00, 0x60, 0x60, 0x00, 0x00}, {0x20, 0x10, 0x08, 0x04, 0x02}, {0x3e, 0x51, 0x49, 0x45, 0x3e}, {0x00, 0x42, 0x7f, 0x40, 0x00}, {0x42, 0x61, 0x51, 0x49, 0x46}, {0x21, 0x41, 0x45, 0x4b, 0x31}, {0x18, 0x14, 0x12, 0x7f, 0x10}, {0x27, 0x45, 0x45, 0x45, 0x39}, {0x3c, 0x4a, 0x49, 0x49, 0x30}, {0x01, 0x71, 0x09, 0x05, 0x03}, {0x36, 0x49, 0x49, 0x49, 0x36}, {0x06, 0x49, 0x49, 0x29, 0x1e}, {0x00, 0x36, 0x36, 0x00, 0x00}, {0x00, 0x56, 0x36, 0x00, 0x00}, {0x08, 0x14, 0x22, 0x41, 0x00}, {0x14, 0x14, 0x14, 0x14, 0x14}, {0x00, 0x41, 0x22, 0x14, 0x08}, {0x02, 0x01, 0x51, 0x09, 0x06}, {0x32, 0x49, 0x79, 0x41, 0x3e}, {0x7e, 0x11, 0x11, 0x11, 0x7e}, {0x7f, 0x49, 0x49, 0x49, 0x36}, {0x3e, 0x41, 0x41, 0x41, 0x22}, {0x7f, 0x41, 0x41, 0x22, 0x1c}, {0x7f, 0x49, 0x49, 0x49, 0x41}, {0x7f, 0x09, 0x09, 0x09, 0x01}, {0x3e, 0x41, 0x49, 0x49, 0x7a}, {0x7f, 0x08, 0x08, 0x08, 0x7f}, {0x00, 0x41, 0x7f, 0x41, 0x00}, {0x20, 0x40, 0x41, 0x3f, 0x01}, {0x7f, 0x08, 0x14, 0x22, 0x41}, {0x7f, 0x40, 0x40, 0x40, 0x40}, {0x7f, 0x02, 0x0c, 0x02, 0x7f}, {0x7f, 0x04, 0x08, 0x10, 0x7f}, {0x3e, 0x41, 0x41, 0x41, 0x3e}, {0x7f, 0x09, 0x09, 0x09, 0x06}, {0x3e, 0x41, 0x51, 0x21, 0x5e}, {0x7f, 0x09, 0x19, 0x29, 0x46}, {0x46, 0x49, 0x49, 0x49, 0x31}, {0x01, 0x01, 0x7f, 0x01, 0x01}, {0x3f, 0x40, 0x40, 0x40, 0x3f}, {0x1f, 0x20, 0x40, 0x20, 0x1f}, {0x3f, 0x40, 0x38, 0x40, 0x3f}, {0x63, 0x14, 0x08, 0x14, 0x63}, {0x07, 0x08, 0x70, 0x08, 0x07}, {0x61, 0x51, 0x49, 0x45, 0x43}, {0x00, 0x7f, 0x41, 0x41, 0x00}, {0x02, 0x04, 0x08, 0x10, 0x20}, {0x00, 0x41, 0x41, 0x7f, 0x00}, {0x04, 0x02, 0x01, 0x02, 0x04}, {0x40, 0x40, 0x40, 0x40, 0x40}, {0x00, 0x01, 0x02, 0x04, 0x00}, {0x20, 0x54, 0x54, 0x54, 0x78}, {0x7f, 0x48, 0x44, 0x44, 0x38}, {0x38, 0x44, 0x44, 0x44, 0x20}, {0x38, 0x44, 0x44, 0x48, 0x7f}, {0x38, 0x54, 0x54, 0x54, 0x18}, {0x08, 0x7e, 0x09, 0x01, 0x02}, {0x0c, 0x52, 0x52, 0x52, 0x3e}, {0x7f, 0x08, 0x04, 0x04, 0x78}, {0x00, 0x44, 0x7d, 0x40, 0x00}, {0x20, 0x40, 0x44, 0x3d, 0x00}, {0x7f, 0x10, 0x28, 0x44, 0x00}, {0x00, 0x41, 0x7f, 0x40, 0x00}, {0x7c, 0x04, 0x18, 0x04, 0x78}, {0x7c, 0x08, 0x04, 0x04, 0x78}, {0x38, 0x44, 0x44, 0x44, 0x38}, {0x7c, 0x14, 0x14, 0x14, 0x08}, {0x08, 0x14, 0x14, 0x18, 0x7c}, {0x7c, 0x08, 0x04, 0x04, 0x08}, {0x48, 0x54, 0x54, 0x54, 0x20}, {0x04, 0x3f, 0x44, 0x40, 0x20}, {0x3c, 0x40, 0x40, 0x20, 0x7c}, {0x1c, 0x20, 0x40, 0x20, 0x1c}, {0x3c, 0x40, 0x30, 0x40, 0x3c}, {0x44, 0x28, 0x10, 0x28, 0x44}, {0x0c, 0x50, 0x50, 0x50, 0x3c}, {0x44, 0x64, 0x54, 0x4c, 0x44}, {0x00, 0x08, 0x36, 0x41, 0x00}, {0x00, 0x00, 0x7f, 0x00, 0x00}, {0x00, 0x41, 0x36, 0x08, 0x00}, {0x10, 0x08, 0x10, 0x08, 0x00}};
 
@@ -156,6 +178,18 @@ void initDataManagement()
       rtcData.savedScreen = 0;
       rtcData.screenTimeoutMs = 6000;
       rtcData.nightMode = false;
+
+      rtcData.targetMax = 10.0;
+      rtcData.targetMin = 3.9;
+      rtcData.graphHours = 5;
+
+      for (int i = 0; i < MAX_ALARMS; i++)
+      {
+        rtcData.alarms[i].enabled = false;
+        rtcData.alarms[i].lastDay = -1;
+      }
+      rtcData.snoozeTimestamp = 0;
+      rtcData.snoozedAlarmIndex = -1;
     }
     preferences.end();
   }
@@ -366,7 +400,6 @@ void drawGraphScreen(time_t datetimenow)
   display.clear();
   display.displayOn();
 
-  // ХЕДЕР
   drawRetroText(2, 2, "HISTORY", 1);
   String currBg = rtcData.hasLastData ? String(rtcData.lastBG) : "---";
   int w = getRetroTextWidth(currBg, 1);
@@ -374,59 +407,59 @@ void drawGraphScreen(time_t datetimenow)
 
   display.drawHorizontalLine(0, 11, 128);
 
-  // Y-ОСЬ
-  drawRetroText(0, 24, "10.0", 1);
-  drawRetroText(6, 45, "3.9", 1);
+  int bgMaxInt = (int)(rtcData.targetMax * 18.015);
+  int bgMinInt = (int)(rtcData.targetMin * 18.015);
 
-  // Пунктирні лінії цільового діапазону
+  if (bgMaxInt > 250)
+    bgMaxInt = 250;
+  if (bgMinInt < 40)
+    bgMinInt = 40;
+
+  int yMax = 54 - ((bgMaxInt - 40) * 40 / 210);
+  int yMin = 54 - ((bgMinInt - 40) * 40 / 210);
+
+  drawRetroText(0, yMax - 3, String(rtcData.targetMax, 1), 1);
+  drawRetroText(0, yMin - 3, String(rtcData.targetMin, 1), 1);
+
   for (int x = 26; x < 128; x += 4)
   {
-    display.setPixel(x, 27);
-    display.setPixel(x, 48);
+    display.setPixel(x, yMax);
+    display.setPixel(x, yMin);
   }
 
-  // X-ОСЬ: З ЧАСОВИМ ПОЯСОМ
   time_t baseTime = datetimenow;
   if (rtcData.hasLastData && rtcData.lastBGSDateTime > 0)
   {
     baseTime = rtcData.lastBGSDateTime;
-    adjustTimezone(baseTime); // ВИПРАВЛЕНО ЧАСОВИЙ ПОЯС ДЛЯ ГРАФІКА
+    adjustTimezone(baseTime);
   }
+
+  int hoursSpan = rtcData.graphHours;
+  if (hoursSpan < 1 || hoursSpan > 5)
+    hoursSpan = 5;
+  int maxPoints = hoursSpan * 12;
+  int startIndex = 64 - maxPoints;
 
   int currentMin = minute(baseTime);
   int currentHour = hour(baseTime);
   int offsetPoints = currentMin / 5;
 
-  for (int h = 0; h <= 5; h++)
+  for (int h = 0; h <= hoursSpan; h++)
   {
     int pointIndex = 63 - offsetPoints - (h * 12);
 
-    if (pointIndex >= 0 && pointIndex < 64)
+    if (pointIndex >= startIndex && pointIndex < 64)
     {
-      int x = 26 + (pointIndex * 100 / 63);
+      int x = 26 + ((pointIndex - startIndex) * 100 / (maxPoints - 1));
 
       for (int y = 14; y <= 54; y += 4)
       {
         display.setPixel(x, y);
       }
-
-      int labelHour = currentHour - h;
-      if (labelHour < 0)
-        labelHour += 24;
-
-      String hStr = String(labelHour);
-      if (hStr.length() < 2)
-        hStr = "0" + hStr;
-
-      if (x >= 26)
-      {
-        drawRetroText(x - 6, 56, hStr, 1);
-      }
     }
   }
 
-  // Малювання історії
-  for (int i = 0; i < 64; i++)
+  for (int i = startIndex; i < 64; i++)
   {
     if (rtcData.bgHistory[i] > 0)
     {
@@ -436,12 +469,95 @@ void drawGraphScreen(time_t datetimenow)
       if (bg < 40)
         bg = 40;
 
-      int x = 26 + (i * 100 / 63);
+      int x = 26 + ((i - startIndex) * 100 / (maxPoints - 1));
       int y = 54 - ((bg - 40) * 40 / 210);
 
       display.fillRect(x, y, 2, 2);
     }
   }
+
+  display.display();
+}
+
+void drawAlarmsScreen(time_t datetimenow)
+{
+  display.clear();
+  display.displayOn();
+
+  drawRetroText(2, 2, "ALARMS LIST", 1);
+  display.drawHorizontalLine(0, 11, 128);
+
+  int enabledCount = 0;
+  int activeAlarms[MAX_ALARMS];
+
+  for (int i = 0; i < MAX_ALARMS; i++)
+  {
+    if (rtcData.alarms[i].enabled)
+    {
+      activeAlarms[enabledCount] = i;
+      enabledCount++;
+    }
+  }
+
+  if (enabledCount == 0)
+  {
+    int w = getRetroTextWidth("NO ACTIVE ALARMS", 1);
+    drawRetroText(64 - w / 2, 30, "NO ACTIVE ALARMS", 1);
+    display.display();
+    return;
+  }
+
+  int maxOffset = (enabledCount > 4) ? enabledCount - 4 : 0;
+  if (alarmPageOffset > maxOffset)
+    alarmPageOffset = maxOffset;
+  if (alarmPageOffset < 0)
+    alarmPageOffset = 0;
+
+  int y = 14;
+  for (int i = alarmPageOffset; i < min(alarmPageOffset + 4, enabledCount); i++)
+  {
+    int idx = activeAlarms[i];
+    String hStr = (rtcData.alarms[idx].hour < 10 ? "0" : "") + String(rtcData.alarms[idx].hour);
+    String mStr = (rtcData.alarms[idx].minute < 10 ? "0" : "") + String(rtcData.alarms[idx].minute);
+
+    String timeStr = hStr + ":" + mStr;
+
+    uint8_t mask = rtcData.alarms[idx].daysMask;
+    String daysStr = "";
+
+    if (mask == 127)
+      daysStr = "ALL DAYS";
+    else if (mask == 62)
+      daysStr = "WORKDAYS";
+    else if (mask == 65)
+      daysStr = "WEEKEND";
+    else
+    {
+      if (mask & 2)
+        daysStr += "M ";
+      if (mask & 4)
+        daysStr += "T ";
+      if (mask & 8)
+        daysStr += "W ";
+      if (mask & 16)
+        daysStr += "T ";
+      if (mask & 32)
+        daysStr += "F ";
+      if (mask & 64)
+        daysStr += "S ";
+      if (mask & 1)
+        daysStr += "S";
+    }
+
+    drawRetroText(2, y, timeStr, 1);
+    drawRetroText(40, y, daysStr, 1);
+    y += 11;
+  }
+
+  if (alarmPageOffset > 0)
+    drawRetroText(118, 14, "^", 1);
+  if (alarmPageOffset < maxOffset)
+    drawRetroText(118, 45, "v", 1);
 
   display.display();
 }
@@ -454,7 +570,6 @@ void updateDisplay()
 
   time_t local_display_time = current_rtc_time;
   adjustTimezone(local_display_time);
-  setTime(local_display_time);
 
   if (rtcData.nightMode)
     display.invertDisplay();
@@ -503,6 +618,10 @@ void updateDisplay()
   {
     drawGraphScreen(local_display_time);
   }
+  else if (rtcData.savedScreen == 4)
+  {
+    drawAlarmsScreen(local_display_time);
+  }
 }
 
 // --- NATIVE BLE CALLBACKS ---
@@ -533,7 +652,6 @@ class DataCallbacks : public BLECharacteristicCallbacks
       payload += rxValue[i];
     }
     payload.trim();
-    Serial.println("ОТРИМАНО ДАНІ: " + payload);
 
     String values[20];
     int count = 0, startIndex = 0;
@@ -556,12 +674,21 @@ class DataCallbacks : public BLECharacteristicCallbacks
 
     if (count >= 4)
     {
+      // ЧИСТО: Беремо час сенсора ЛИШЕ для збереження в історію! Жодного settimeofday()!
       int newTime = values[3].toInt();
 
       float rawBg = values[0].toFloat();
       int graphBg = (rawBg < 30.0) ? (int)(rawBg * 18.01) : (int)rawBg;
 
-      // РОЗУМНИЙ ЗСУВ ІСТОРІЇ
+      if (newTime != rtcData.lastBGSDateTime)
+      {
+        float checkBgMmol = (rawBg < 30.0) ? rawBg : (rawBg / 18.01);
+        if (checkBgMmol > rtcData.targetMax || checkBgMmol < rtcData.targetMin)
+        {
+          needsVibration = true;
+        }
+      }
+
       if (rtcData.lastBGSDateTime == 0)
       {
         rtcData.bgHistory[63] = graphBg;
@@ -642,17 +769,15 @@ class SettingsCallbacks : public BLECharacteristicCallbacks
       payload += rxValue[i];
     }
     payload.trim();
-    Serial.println("ОТРИМАНО НАЛАШТУВАННЯ: " + payload);
 
+    // ЧИСТО: Синхронізація годинника ТІЛЬКИ через команду TIME:
     if (payload.startsWith("TIME:"))
     {
       time_t newTime = payload.substring(5).toInt();
-      if (newTime > 0)
+      if (newTime > 1600000000)
       {
         struct timeval tv = {.tv_sec = newTime};
         settimeofday(&tv, NULL);
-        setTime(newTime);
-        Serial.println("Час оновлено вручну!");
         newDataReceived = true;
       }
     }
@@ -674,18 +799,68 @@ class SettingsCallbacks : public BLECharacteristicCallbacks
         char nVal = payload.charAt(nIndex);
         rtcData.nightMode = (nVal == '1');
       }
+      if (payload.indexOf("MAX=") != -1)
+      {
+        int idx = payload.indexOf("MAX=") + 4;
+        int end = payload.indexOf(";", idx);
+        if (end == -1)
+          end = payload.length();
+        rtcData.targetMax = payload.substring(idx, end).toFloat();
+      }
+      if (payload.indexOf("MIN=") != -1)
+      {
+        int idx = payload.indexOf("MIN=") + 4;
+        int end = payload.indexOf(";", idx);
+        if (end == -1)
+          end = payload.length();
+        rtcData.targetMin = payload.substring(idx, end).toFloat();
+      }
+
+      if (payload.indexOf("ALMCLEAR=1") != -1)
+      {
+        for (int i = 0; i < MAX_ALARMS; i++)
+        {
+          rtcData.alarms[i].enabled = false;
+        }
+      }
+
+      for (int i = 0; i < MAX_ALARMS; i++)
+      {
+        String key = "ALM" + String(i) + "=";
+        int idx = payload.indexOf(key);
+        if (idx != -1)
+        {
+          idx += key.length();
+          int hour = payload.substring(idx, idx + 2).toInt();
+          int min = payload.substring(idx + 3, idx + 5).toInt();
+
+          int comma1 = payload.indexOf(',', idx);
+          int comma2 = payload.indexOf(',', comma1 + 1);
+          int end = payload.indexOf(';', comma2);
+          if (end == -1)
+            end = payload.length();
+
+          int mask = payload.substring(comma1 + 1, comma2).toInt();
+          bool en = (payload.substring(comma2 + 1, end).toInt() == 1);
+
+          rtcData.alarms[i].hour = hour;
+          rtcData.alarms[i].minute = min;
+          rtcData.alarms[i].daysMask = mask;
+          rtcData.alarms[i].enabled = en;
+          rtcData.alarms[i].lastDay = -1;
+        }
+      }
+
       backupDataToFlash();
       newDataReceived = true;
     }
   }
 };
 
-// --- ФОНОВА ЗАДАЧА NATIVE BLE (ЕКСТРЕМАЛЬНЕ ЕНЕРГОЗБЕРЕЖЕННЯ) ---
 void bleTask(void *parameter)
 {
   BLEDevice::init("GlucoWatch_ESP");
 
-  // НОВЕ: Знижуємо потужність антени до мінімуму для збереження батареї
   esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, ESP_PWR_LVL_N12);
   esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, ESP_PWR_LVL_N12);
 
@@ -713,24 +888,33 @@ void bleTask(void *parameter)
   BLEDevice::startAdvertising();
 
   unsigned long absoluteStart = millis();
+  unsigned long dataGraceStart = 0;
 
-  // НОВЕ: Жорсткий ліміт очікування BLE (рівно 10 секунд)
   while (true)
   {
-    if (millis() - absoluteStart > 10000)
+    unsigned long elapsed = millis() - absoluteStart;
+
+    if (!deviceConnected && elapsed > 10000)
     {
       if (!newDataReceived)
         strcpy(rtcData.fetchStatus, "BLE Sleep");
       break;
     }
 
-    if (deviceConnected && (millis() - absoluteStart > 13000))
+    if (elapsed > 15000)
     {
       break;
     }
 
-    if (newDataReceived)
+    if (newDataReceived && dataGraceStart == 0)
+    {
+      dataGraceStart = millis();
+    }
+
+    if (dataGraceStart > 0 && (millis() - dataGraceStart > 2000))
+    {
       break;
+    }
 
     delay(50);
   }
@@ -740,12 +924,14 @@ void bleTask(void *parameter)
   vTaskDelete(NULL);
 }
 
-// --- SETUP ---
 void setup()
 {
   setCpuFrequencyMhz(80);
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
   Serial.begin(115200);
+
+  pinMode(VIBE_PIN, OUTPUT);
+  digitalWrite(VIBE_PIN, LOW);
 
   setenv("TZ", tzInfo, 1);
   tzset();
@@ -793,7 +979,98 @@ void setup()
     bleTaskComplete = true;
   }
 
-  if (wokeByButton || coldBoot)
+  // --- ЛОГІКА ТРИГЕРА БУДИЛЬНИКА ---
+  time_t local_display_time = current_rtc_time;
+  adjustTimezone(local_display_time);
+
+  bool triggerAlarm = false;
+  int currentAlarmIndex = -1;
+
+  int currentDayOfWeek = weekday(local_display_time) - 1;
+  int currentDayOfMonth = day(local_display_time);
+
+  for (int i = 0; i < MAX_ALARMS; i++)
+  {
+    if (rtcData.alarms[i].enabled)
+    {
+      if (rtcData.alarms[i].daysMask & (1 << currentDayOfWeek))
+      {
+        if (hour(local_display_time) == rtcData.alarms[i].hour &&
+            minute(local_display_time) >= rtcData.alarms[i].minute &&
+            minute(local_display_time) < rtcData.alarms[i].minute + 5)
+        {
+
+          if (currentDayOfMonth != rtcData.alarms[i].lastDay)
+          {
+            triggerAlarm = true;
+            currentAlarmIndex = i;
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  if (rtcData.snoozeTimestamp > 0 && current_rtc_time >= rtcData.snoozeTimestamp)
+  {
+    triggerAlarm = true;
+    currentAlarmIndex = rtcData.snoozedAlarmIndex;
+  }
+
+  // ЕКРАН АКТИВАЦІЇ БУДИЛЬНИКА
+  if (triggerAlarm && currentAlarmIndex != -1)
+  {
+    display.clear();
+    display.displayOn();
+    int w = getRetroTextWidth("WAKE UP!", 2);
+    drawRetroText(64 - w / 2, 10, "WAKE UP!", 2);
+
+    String tStr = (rtcData.alarms[currentAlarmIndex].hour < 10 ? "0" : "") + String(rtcData.alarms[currentAlarmIndex].hour) + ":" + (rtcData.alarms[currentAlarmIndex].minute < 10 ? "0" : "") + String(rtcData.alarms[currentAlarmIndex].minute);
+    int tw = getRetroTextWidth(tStr, 1);
+    drawRetroText(64 - tw / 2, 30, tStr, 1);
+
+    drawRetroText(0, 55, "<SNOOZE", 1);
+    int stopW = getRetroTextWidth("STOP>", 1);
+    drawRetroText(128 - stopW, 55, "STOP>", 1);
+    display.display();
+
+    unsigned long alarmStart = millis();
+    bool snoozed = false;
+
+    while (millis() - alarmStart < 30000)
+    {
+      digitalWrite(VIBE_PIN, HIGH);
+      delay(200);
+      digitalWrite(VIBE_PIN, LOW);
+      delay(200);
+
+      if (digitalRead(BUTTON_LEFT_PIN) == LOW)
+      {
+        snoozed = true;
+        break;
+      }
+      if (digitalRead(BUTTON_RIGHT_PIN) == LOW)
+      {
+        break;
+      }
+    }
+
+    digitalWrite(VIBE_PIN, LOW);
+
+    if (snoozed)
+    {
+      rtcData.snoozeTimestamp = current_rtc_time + 300;
+      rtcData.snoozedAlarmIndex = currentAlarmIndex;
+    }
+    else
+    {
+      rtcData.alarms[currentAlarmIndex].lastDay = currentDayOfMonth;
+      rtcData.snoozeTimestamp = 0;
+    }
+    backupDataToFlash();
+  }
+
+  if (wokeByButton || coldBoot || triggerAlarm)
   {
     updateDisplay();
 
@@ -813,9 +1090,10 @@ void setup()
       if (digitalRead(BUTTON_LEFT_PIN) == LOW)
       {
         rtcData.savedScreen++;
-        if (rtcData.savedScreen > 3)
+        if (rtcData.savedScreen > 4)
           rtcData.savedScreen = 0;
         weatherDayOffset = 0;
+        alarmPageOffset = 0;
         updateDisplay();
         lastInputTime = millis();
         delay(250);
@@ -824,12 +1102,14 @@ void setup()
       {
         rtcData.savedScreen--;
         if (rtcData.savedScreen < 0)
-          rtcData.savedScreen = 3;
+          rtcData.savedScreen = 4;
         weatherDayOffset = 0;
+        alarmPageOffset = 0;
         updateDisplay();
         lastInputTime = millis();
         delay(250);
       }
+
       if (rtcData.savedScreen == 2)
       {
         if (digitalRead(BUTTON_PREV_PIN) == LOW)
@@ -844,6 +1124,43 @@ void setup()
         {
           if (weatherDayOffset < 4)
             weatherDayOffset++;
+          updateDisplay();
+          lastInputTime = millis();
+          delay(200);
+        }
+      }
+      else if (rtcData.savedScreen == 3)
+      {
+        if (digitalRead(BUTTON_PREV_PIN) == LOW)
+        {
+          if (rtcData.graphHours > 1)
+            rtcData.graphHours--;
+          updateDisplay();
+          lastInputTime = millis();
+          delay(200);
+        }
+        if (digitalRead(BUTTON_NEXT_PIN) == LOW)
+        {
+          if (rtcData.graphHours < 5)
+            rtcData.graphHours++;
+          updateDisplay();
+          lastInputTime = millis();
+          delay(200);
+        }
+      }
+      else if (rtcData.savedScreen == 4)
+      {
+        if (digitalRead(BUTTON_PREV_PIN) == LOW)
+        {
+          if (alarmPageOffset > 0)
+            alarmPageOffset--;
+          updateDisplay();
+          lastInputTime = millis();
+          delay(200);
+        }
+        if (digitalRead(BUTTON_NEXT_PIN) == LOW)
+        {
+          alarmPageOffset++;
           updateDisplay();
           lastInputTime = millis();
           delay(200);
@@ -869,7 +1186,7 @@ void setup()
   else
   {
     unsigned long startWait = millis();
-    while (!bleTaskComplete && millis() - startWait < 11000)
+    while (!bleTaskComplete && millis() - startWait < 15000)
     {
       if (digitalRead(BUTTON_RIGHT_PIN) == LOW || digitalRead(BUTTON_LEFT_PIN) == LOW)
       {
@@ -879,6 +1196,20 @@ void setup()
       delay(10);
     }
   }
+
+  if (needsVibration)
+  {
+    for (int i = 0; i < 3; i++)
+    {
+      digitalWrite(VIBE_PIN, HIGH);
+      delay(250);
+      digitalWrite(VIBE_PIN, LOW);
+      delay(250);
+    }
+    needsVibration = false;
+  }
+
+  digitalWrite(VIBE_PIN, LOW);
 
   gettimeofday(&tv_now, NULL);
   current_rtc_time = tv_now.tv_sec;
