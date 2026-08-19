@@ -42,7 +42,6 @@ const int ADC_RESOLUTION = 4095;
 #define DATA_CHAR_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 #define SETTINGS_CHAR_UUID "a1b2c3d4-e5f6-7890-1234-56789abcdef0"
 
-// --- ДИНАМІЧНИЙ ПУЛ БУДИЛЬНИКІВ ---
 #define MAX_ALARMS 10
 
 struct AlarmDef
@@ -85,10 +84,13 @@ struct PersistentData
   AlarmDef alarms[MAX_ALARMS];
   time_t snoozeTimestamp;
   int snoozedAlarmIndex;
+
+  bool glucVibeEnabled;
+  time_t glucSnoozeUntil;
 };
 
 RTC_DATA_ATTR PersistentData rtcData;
-#define DATA_MAGIC 0xBEEF000C // Оновлено для чистої логіки без фаєрволу
+#define DATA_MAGIC 0xBEEF000C
 Preferences preferences;
 
 // --- СТАТУСИ ---
@@ -99,6 +101,8 @@ volatile bool screenNeedsUpdate = false;
 volatile bool needsVibration = false;
 int weatherDayOffset = 0;
 int alarmPageOffset = 0;
+volatile int settingsCursor = 0;
+volatile bool viewingAlarms = false;
 
 // --- Bitmaps ---
 const unsigned char ArrowUp[] PROGMEM = {0x80, 0x00, 0xc0, 0x01, 0xe0, 0x03, 0xf0, 0x07, 0xf8, 0x0f, 0xfc, 0x1f, 0xde, 0x3d, 0xcf, 0x79, 0xc7, 0x71, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01, 0xc0, 0x01};
@@ -190,6 +194,9 @@ void initDataManagement()
       }
       rtcData.snoozeTimestamp = 0;
       rtcData.snoozedAlarmIndex = -1;
+
+      rtcData.glucVibeEnabled = true;
+      rtcData.glucSnoozeUntil = 0;
     }
     preferences.end();
   }
@@ -562,6 +569,49 @@ void drawAlarmsScreen(time_t datetimenow)
   display.display();
 }
 
+// ЕКРАН НАЛАШТУВАНЬ МЕНЮ
+void drawSettingsScreen(time_t datetimenow)
+{
+  if (viewingAlarms)
+  {
+    drawAlarmsScreen(datetimenow);
+    return;
+  }
+
+  display.clear();
+  display.displayOn();
+
+  drawRetroText(2, 0, "SETTINGS", 1);
+  display.drawHorizontalLine(0, 9, 128);
+
+  String items[4] = {
+      "ALARMS LIST",
+      "GLUC VIBE: " + String(rtcData.glucVibeEnabled ? "ON" : "OFF"),
+      "SNOOZE 1 HOUR",
+      "SNOOZE 8 HOURS"};
+
+  struct timeval tv_now;
+  gettimeofday(&tv_now, NULL);
+  if (rtcData.glucSnoozeUntil > tv_now.tv_sec)
+  {
+    int remains = (rtcData.glucSnoozeUntil - tv_now.tv_sec) / 60;
+    items[2] = "SNOOZED (" + String(remains) + "m)";
+    items[3] = "CANCEL SNOOZE";
+  }
+
+  for (int i = 0; i < 4; i++)
+  {
+    int y = 13 + i * 12;
+    if (settingsCursor == i)
+    {
+      drawRetroText(0, y, ">", 1); // Вказівник курсора
+    }
+    drawRetroText(8, y, items[i], 1);
+  }
+
+  display.display();
+}
+
 void updateDisplay()
 {
   struct timeval tv_now;
@@ -620,7 +670,7 @@ void updateDisplay()
   }
   else if (rtcData.savedScreen == 4)
   {
-    drawAlarmsScreen(local_display_time);
+    drawSettingsScreen(local_display_time);
   }
 }
 
@@ -674,18 +724,23 @@ class DataCallbacks : public BLECharacteristicCallbacks
 
     if (count >= 4)
     {
-      // ЧИСТО: Беремо час сенсора ЛИШЕ для збереження в історію! Жодного settimeofday()!
       int newTime = values[3].toInt();
 
       float rawBg = values[0].toFloat();
       int graphBg = (rawBg < 30.0) ? (int)(rawBg * 18.01) : (int)rawBg;
 
+      // ВІБРАЦІЯ З ВРАХУВАННЯМ SNOOZE ТА НАЛАШТУВАНЬ
       if (newTime != rtcData.lastBGSDateTime)
       {
         float checkBgMmol = (rawBg < 30.0) ? rawBg : (rawBg / 18.01);
         if (checkBgMmol > rtcData.targetMax || checkBgMmol < rtcData.targetMin)
         {
-          needsVibration = true;
+          struct timeval tv_now;
+          gettimeofday(&tv_now, NULL);
+          if (rtcData.glucVibeEnabled && tv_now.tv_sec > rtcData.glucSnoozeUntil)
+          {
+            needsVibration = true;
+          }
         }
       }
 
@@ -770,7 +825,6 @@ class SettingsCallbacks : public BLECharacteristicCallbacks
     }
     payload.trim();
 
-    // ЧИСТО: Синхронізація годинника ТІЛЬКИ через команду TIME:
     if (payload.startsWith("TIME:"))
     {
       time_t newTime = payload.substring(5).toInt();
@@ -1087,84 +1141,132 @@ void setup()
 
     while (millis() - lastInputTime < currentTimeout)
     {
+
+      // 1. ВЕРХНІ КНОПКИ: Тільки гортання головних екранів
       if (digitalRead(BUTTON_LEFT_PIN) == LOW)
       {
-        rtcData.savedScreen++;
-        if (rtcData.savedScreen > 4)
-          rtcData.savedScreen = 0;
-        weatherDayOffset = 0;
-        alarmPageOffset = 0;
+        if (rtcData.savedScreen == 4 && viewingAlarms)
+        {
+          viewingAlarms = false; // Вихід з підменю будильників назад у налаштування
+        }
+        else
+        {
+          rtcData.savedScreen++;
+          if (rtcData.savedScreen > 4)
+            rtcData.savedScreen = 0;
+          weatherDayOffset = 0;
+          alarmPageOffset = 0;
+          settingsCursor = 0;
+          viewingAlarms = false;
+        }
         updateDisplay();
         lastInputTime = millis();
         delay(250);
       }
       if (digitalRead(BUTTON_RIGHT_PIN) == LOW)
       {
-        rtcData.savedScreen--;
-        if (rtcData.savedScreen < 0)
-          rtcData.savedScreen = 4;
-        weatherDayOffset = 0;
-        alarmPageOffset = 0;
+        if (rtcData.savedScreen == 4 && viewingAlarms)
+        {
+          viewingAlarms = false; // Вихід з підменю будильників назад у налаштування
+        }
+        else
+        {
+          rtcData.savedScreen--;
+          if (rtcData.savedScreen < 0)
+            rtcData.savedScreen = 4;
+          weatherDayOffset = 0;
+          alarmPageOffset = 0;
+          settingsCursor = 0;
+          viewingAlarms = false;
+        }
         updateDisplay();
         lastInputTime = millis();
         delay(250);
       }
 
-      if (rtcData.savedScreen == 2)
+      // 2. НИЖНЯ КНОПКА PREV: Підтвердження / Зменшення
+      if (digitalRead(BUTTON_PREV_PIN) == LOW)
       {
-        if (digitalRead(BUTTON_PREV_PIN) == LOW)
+        if (rtcData.savedScreen == 2)
         {
           if (weatherDayOffset > 0)
             weatherDayOffset--;
-          updateDisplay();
-          lastInputTime = millis();
-          delay(200);
         }
-        if (digitalRead(BUTTON_NEXT_PIN) == LOW)
-        {
-          if (weatherDayOffset < 4)
-            weatherDayOffset++;
-          updateDisplay();
-          lastInputTime = millis();
-          delay(200);
-        }
-      }
-      else if (rtcData.savedScreen == 3)
-      {
-        if (digitalRead(BUTTON_PREV_PIN) == LOW)
+        else if (rtcData.savedScreen == 3)
         {
           if (rtcData.graphHours > 1)
             rtcData.graphHours--;
-          updateDisplay();
-          lastInputTime = millis();
-          delay(200);
         }
-        if (digitalRead(BUTTON_NEXT_PIN) == LOW)
+        else if (rtcData.savedScreen == 4)
+        {
+          if (viewingAlarms)
+          {
+            if (alarmPageOffset > 0)
+              alarmPageOffset--; // Гортання списку будильників вгору
+          }
+          else
+          {
+            // ПІДТВЕРДЖЕННЯ ВИБОРУ В МЕНЮ
+            if (settingsCursor == 0)
+            {
+              viewingAlarms = true;
+            }
+            else if (settingsCursor == 1)
+            {
+              rtcData.glucVibeEnabled = !rtcData.glucVibeEnabled;
+              backupDataToFlash();
+            }
+            else if (settingsCursor == 2 || settingsCursor == 3)
+            {
+              struct timeval tv_now;
+              gettimeofday(&tv_now, NULL);
+              if (rtcData.glucSnoozeUntil > tv_now.tv_sec)
+              {
+                rtcData.glucSnoozeUntil = 0; // Скасувати
+              }
+              else
+              {
+                rtcData.glucSnoozeUntil = tv_now.tv_sec + (settingsCursor == 2 ? 3600 : 28800);
+              }
+              backupDataToFlash();
+            }
+          }
+        }
+        updateDisplay();
+        lastInputTime = millis();
+        delay(200);
+      }
+
+      // 3. НИЖНЯ КНОПКА NEXT: Рух курсора / Збільшення
+      if (digitalRead(BUTTON_NEXT_PIN) == LOW)
+      {
+        if (rtcData.savedScreen == 2)
+        {
+          if (weatherDayOffset < 4)
+            weatherDayOffset++;
+        }
+        else if (rtcData.savedScreen == 3)
         {
           if (rtcData.graphHours < 5)
             rtcData.graphHours++;
-          updateDisplay();
-          lastInputTime = millis();
-          delay(200);
         }
-      }
-      else if (rtcData.savedScreen == 4)
-      {
-        if (digitalRead(BUTTON_PREV_PIN) == LOW)
+        else if (rtcData.savedScreen == 4)
         {
-          if (alarmPageOffset > 0)
-            alarmPageOffset--;
-          updateDisplay();
-          lastInputTime = millis();
-          delay(200);
+          if (viewingAlarms)
+          {
+            alarmPageOffset++; // Гортання списку будильників вниз
+          }
+          else
+          {
+            // РУХ КУРСОРУ ВНИЗ ПО МЕНЮ
+            settingsCursor++;
+            if (settingsCursor > 3)
+              settingsCursor = 0;
+          }
         }
-        if (digitalRead(BUTTON_NEXT_PIN) == LOW)
-        {
-          alarmPageOffset++;
-          updateDisplay();
-          lastInputTime = millis();
-          delay(200);
-        }
+        updateDisplay();
+        lastInputTime = millis();
+        delay(200);
       }
 
       if (screenNeedsUpdate)
