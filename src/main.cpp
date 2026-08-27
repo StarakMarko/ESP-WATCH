@@ -87,10 +87,12 @@ struct PersistentData
 
   bool glucVibeEnabled;
   time_t glucSnoozeUntil;
+
+  int highScore; // Збереження рекорду для міні-гри
 };
 
 RTC_DATA_ATTR PersistentData rtcData;
-#define DATA_MAGIC 0xBEEF000C
+#define DATA_MAGIC 0xBEEF000D // Оновлено магічне число
 Preferences preferences;
 
 // --- СТАТУСИ ---
@@ -118,6 +120,19 @@ const uint8_t W_Cloud[] PROGMEM = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0
 const uint8_t W_Rain[] PROGMEM = {0x00, 0x00, 0x00, 0x00, 0x80, 0x03, 0xc0, 0x0f, 0xe0, 0x1f, 0xf0, 0x3f, 0xf8, 0x7f, 0xfc, 0xff, 0xfc, 0xff, 0xfc, 0xff, 0xf8, 0x7f, 0x00, 0x00, 0x24, 0x24, 0x12, 0x48, 0x24, 0x24, 0x12, 0x48};
 const uint8_t W_Snow[] PROGMEM = {0x00, 0x00, 0x00, 0x00, 0x80, 0x03, 0xc0, 0x0f, 0xe0, 0x1f, 0xf0, 0x3f, 0xf8, 0x7f, 0xfc, 0xff, 0xfc, 0xff, 0xfc, 0xff, 0xf8, 0x7f, 0x00, 0x00, 0x42, 0x42, 0x24, 0x24, 0x42, 0x42, 0x00, 0x00};
 const uint8_t W_Thunder[] PROGMEM = {0x00, 0x00, 0x00, 0x00, 0x80, 0x03, 0xc0, 0x0f, 0xe0, 0x1f, 0xf0, 0x3f, 0xf8, 0x7f, 0xfc, 0xff, 0xfc, 0xff, 0xfc, 0xff, 0xf8, 0x7f, 0x00, 0x00, 0x20, 0x04, 0x60, 0x0c, 0xc0, 0x03, 0x40, 0x01};
+
+// СПРАЙТИ ДЛЯ ГРИ (16x16)
+const uint8_t DinoBmp[] PROGMEM = {
+    0x00, 0xFF, 0x00, 0xBF, 0x00, 0xFF, 0x00, 0x0F,
+    0x00, 0xFF, 0x01, 0x1F, 0x03, 0x0F, 0x07, 0x0F,
+    0xFE, 0x07, 0xFC, 0x07, 0xF8, 0x01, 0xF0, 0x00,
+    0x90, 0x00, 0x90, 0x00, 0x98, 0x01, 0x00, 0x00};
+
+const uint8_t CactusBmp[] PROGMEM = {
+    0x80, 0x01, 0x80, 0x01, 0x80, 0x01, 0x8C, 0x11,
+    0x8C, 0x19, 0x8C, 0x19, 0x8C, 0x19, 0xFC, 0x19,
+    0xF8, 0x19, 0x80, 0x19, 0x80, 0x1F, 0x80, 0x0F,
+    0x80, 0x01, 0x80, 0x01, 0x80, 0x01, 0x80, 0x01};
 
 const char *const _DOW_NAMES[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
 const char *const _MON_NAMES[] = {"", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
@@ -182,6 +197,7 @@ void initDataManagement()
       rtcData.savedScreen = 0;
       rtcData.screenTimeoutMs = 6000;
       rtcData.nightMode = false;
+      rtcData.highScore = 0;
 
       rtcData.targetMax = 10.0;
       rtcData.targetMin = 3.9;
@@ -243,6 +259,24 @@ void drawChunkyIcon(int startX, int startY, const uint8_t *icon)
       if (line & (1 << col))
       {
         display.fillRect(startX + col * 2, startY + row * 2, 2, 2);
+      }
+    }
+  }
+}
+
+// Функція для малювання 16x16 спрайтів без масштабування
+void drawSprite16(int startX, int startY, const uint8_t *icon)
+{
+  for (int row = 0; row < 16; row++)
+  {
+    uint8_t b1 = pgm_read_byte(&icon[row * 2]);
+    uint8_t b2 = pgm_read_byte(&icon[row * 2 + 1]);
+    uint16_t line = b1 | (b2 << 8);
+    for (int col = 0; col < 16; col++)
+    {
+      if (line & (1 << col))
+      {
+        display.setPixel(startX + col, startY + row);
       }
     }
   }
@@ -408,6 +442,7 @@ void drawGraphScreen(time_t datetimenow)
   display.displayOn();
 
   drawRetroText(2, 2, "HISTORY", 1);
+
   String currBg = rtcData.hasLastData ? String(rtcData.lastBG) : "---";
   int w = getRetroTextWidth(currBg, 1);
   drawRetroText(126 - w, 2, currBg, 1);
@@ -425,6 +460,7 @@ void drawGraphScreen(time_t datetimenow)
   int yMax = 54 - ((bgMaxInt - 40) * 40 / 210);
   int yMin = 54 - ((bgMinInt - 40) * 40 / 210);
 
+  // Цільовий діапазон (Y-вісь)
   drawRetroText(0, yMax - 3, String(rtcData.targetMax, 1), 1);
   drawRetroText(0, yMin - 3, String(rtcData.targetMin, 1), 1);
 
@@ -451,6 +487,7 @@ void drawGraphScreen(time_t datetimenow)
   int currentHour = hour(baseTime);
   int offsetPoints = currentMin / 5;
 
+  // Малюємо вертикальні лінії-підказки та ПОЗНАЧКИ ЧАСУ (годин) на осі X
   for (int h = 0; h <= hoursSpan; h++)
   {
     int pointIndex = 63 - offsetPoints - (h * 12);
@@ -459,13 +496,33 @@ void drawGraphScreen(time_t datetimenow)
     {
       int x = 26 + ((pointIndex - startIndex) * 100 / (maxPoints - 1));
 
+      // Вертикальний пунктир гратки
       for (int y = 14; y <= 54; y += 4)
       {
         display.setPixel(x, y);
       }
+
+      // Години знизу графіка
+      int displayHour = currentHour - h;
+      if (displayHour < 0)
+        displayHour += 24;
+
+      String hStr = String(displayHour);
+      int tw = getRetroTextWidth(hStr, 1);
+
+      // Вирівнювання тексту, щоб не вилазив за краї екрана
+      int textX = x - tw / 2;
+      if (textX < 26)
+        textX = 26;
+      if (textX + tw > 128)
+        textX = 128 - tw;
+
+      display.drawVerticalLine(x, 54, 3); // Зарубка на осі X
+      drawRetroText(textX, 57, hStr, 1);  // Сама цифра години
     }
   }
 
+  // Малюємо самі точки графіку
   for (int i = startIndex; i < 64; i++)
   {
     if (rtcData.bgHistory[i] > 0)
@@ -569,7 +626,6 @@ void drawAlarmsScreen(time_t datetimenow)
   display.display();
 }
 
-// ЕКРАН НАЛАШТУВАНЬ МЕНЮ
 void drawSettingsScreen(time_t datetimenow)
 {
   if (viewingAlarms)
@@ -581,11 +637,12 @@ void drawSettingsScreen(time_t datetimenow)
   display.clear();
   display.displayOn();
 
-  drawRetroText(2, 0, "SETTINGS", 1);
+  drawRetroText(2, 0, "MENU", 1);
   display.drawHorizontalLine(0, 9, 128);
 
-  String items[4] = {
+  String items[5] = {
       "ALARMS LIST",
+      "MINI GAME",
       "GLUC VIBE: " + String(rtcData.glucVibeEnabled ? "ON" : "OFF"),
       "SNOOZE 1 HOUR",
       "SNOOZE 8 HOURS"};
@@ -595,18 +652,26 @@ void drawSettingsScreen(time_t datetimenow)
   if (rtcData.glucSnoozeUntil > tv_now.tv_sec)
   {
     int remains = (rtcData.glucSnoozeUntil - tv_now.tv_sec) / 60;
-    items[2] = "SNOOZED (" + String(remains) + "m)";
-    items[3] = "CANCEL SNOOZE";
+    items[3] = "SNOOZED (" + String(remains) + "m)";
+    items[4] = "CANCEL SNOOZE";
   }
+
+  int startIdx = 0;
+  if (settingsCursor > 3)
+    startIdx = settingsCursor - 3;
 
   for (int i = 0; i < 4; i++)
   {
+    int itemIdx = startIdx + i;
+    if (itemIdx >= 5)
+      break;
+
     int y = 13 + i * 12;
-    if (settingsCursor == i)
+    if (settingsCursor == itemIdx)
     {
-      drawRetroText(0, y, ">", 1); // Вказівник курсора
+      drawRetroText(0, y, ">", 1);
     }
-    drawRetroText(8, y, items[i], 1);
+    drawRetroText(8, y, items[itemIdx], 1);
   }
 
   display.display();
@@ -729,7 +794,6 @@ class DataCallbacks : public BLECharacteristicCallbacks
       float rawBg = values[0].toFloat();
       int graphBg = (rawBg < 30.0) ? (int)(rawBg * 18.01) : (int)rawBg;
 
-      // ВІБРАЦІЯ З ВРАХУВАННЯМ SNOOZE ТА НАЛАШТУВАНЬ
       if (newTime != rtcData.lastBGSDateTime)
       {
         float checkBgMmol = (rawBg < 30.0) ? rawBg : (rawBg / 18.01);
@@ -978,6 +1042,118 @@ void bleTask(void *parameter)
   vTaskDelete(NULL);
 }
 
+// РУШІЙ МІНІ-ГРИ З ДИНОЗАВРОМ І ЗБЕРЕЖЕННЯМ РЕКОРДУ
+void playMiniGame()
+{
+  bool inGame = true;
+  float playerY = 34; // Базова висота через 16x16 спрайт
+  float velocity = 0;
+  float gravity = 0.8;
+  int obsX = 128;
+  int score = 0;
+  bool gameOver = false;
+
+  display.displayOn();
+
+  while (inGame)
+  {
+    display.clear();
+
+    if (gameOver)
+    {
+      int w = getRetroTextWidth("GAME OVER", 2);
+      drawRetroText(64 - w / 2, 15, "GAME OVER", 2);
+
+      String scoreStr = "SCORE: " + String(score);
+      int sw = getRetroTextWidth(scoreStr, 1);
+      drawRetroText(64 - sw / 2, 35, scoreStr, 1);
+
+      String hiStr = "HI: " + String(rtcData.highScore);
+      int hw = getRetroTextWidth(hiStr, 1);
+      drawRetroText(64 - hw / 2, 45, hiStr, 1);
+
+      display.display();
+
+      // Рестарт гри
+      if (digitalRead(BUTTON_PREV_PIN) == LOW || digitalRead(BUTTON_NEXT_PIN) == LOW)
+      {
+        playerY = 34;
+        velocity = 0;
+        obsX = 128;
+        score = 0;
+        gameOver = false;
+        delay(300);
+      }
+      // Вихід з гри
+      if (digitalRead(BUTTON_LEFT_PIN) == LOW)
+      {
+        inGame = false;
+        delay(300);
+      }
+    }
+    else
+    {
+      // Стрибок
+      if ((digitalRead(BUTTON_PREV_PIN) == LOW || digitalRead(BUTTON_NEXT_PIN) == LOW) && playerY >= 34)
+      {
+        velocity = -6.0;
+      }
+      // Вихід
+      if (digitalRead(BUTTON_LEFT_PIN) == LOW)
+      {
+        inGame = false;
+        delay(300);
+      }
+
+      // Фізика
+      velocity += gravity;
+      playerY += velocity;
+      if (playerY > 34)
+      {
+        playerY = 34;
+        velocity = 0;
+      }
+
+      // Рух перешкоди
+      obsX -= (3 + (score / 5));
+      if (obsX < -16)
+      {
+        obsX = 128;
+        score++;
+      }
+
+      // Точне зіткнення
+      if (obsX < 22 && obsX + 12 > 14 && playerY + 14 > 36)
+      {
+        gameOver = true;
+
+        // Збереження нового рекорду в незалежну пам'ять
+        if (score > rtcData.highScore)
+        {
+          rtcData.highScore = score;
+          backupDataToFlash();
+        }
+      }
+
+      // Малюємо Динозавра та Кактус
+      drawSprite16(10, (int)playerY, DinoBmp);
+      drawSprite16(obsX, 34, CactusBmp);
+
+      // Рахунок та Рекорд
+      drawRetroText(64 - getRetroTextWidth(String(score), 1) / 2, 2, String(score), 1);
+
+      String hiStr = "HI:" + String(rtcData.highScore);
+      drawRetroText(126 - getRetroTextWidth(hiStr, 1), 2, hiStr, 1);
+
+      display.drawHorizontalLine(0, 50, 128); // Земля
+
+      display.display();
+    }
+
+    delay(30);
+  }
+}
+
 void setup()
 {
   setCpuFrequencyMhz(80);
@@ -1071,7 +1247,6 @@ void setup()
     currentAlarmIndex = rtcData.snoozedAlarmIndex;
   }
 
-  // ЕКРАН АКТИВАЦІЇ БУДИЛЬНИКА
   if (triggerAlarm && currentAlarmIndex != -1)
   {
     display.clear();
@@ -1142,12 +1317,11 @@ void setup()
     while (millis() - lastInputTime < currentTimeout)
     {
 
-      // 1. ВЕРХНІ КНОПКИ: Тільки гортання головних екранів
       if (digitalRead(BUTTON_LEFT_PIN) == LOW)
       {
         if (rtcData.savedScreen == 4 && viewingAlarms)
         {
-          viewingAlarms = false; // Вихід з підменю будильників назад у налаштування
+          viewingAlarms = false;
         }
         else
         {
@@ -1167,7 +1341,7 @@ void setup()
       {
         if (rtcData.savedScreen == 4 && viewingAlarms)
         {
-          viewingAlarms = false; // Вихід з підменю будильників назад у налаштування
+          viewingAlarms = false;
         }
         else
         {
@@ -1184,7 +1358,6 @@ void setup()
         delay(250);
       }
 
-      // 2. НИЖНЯ КНОПКА PREV: Підтвердження / Зменшення
       if (digitalRead(BUTTON_PREV_PIN) == LOW)
       {
         if (rtcData.savedScreen == 2)
@@ -1202,31 +1375,36 @@ void setup()
           if (viewingAlarms)
           {
             if (alarmPageOffset > 0)
-              alarmPageOffset--; // Гортання списку будильників вгору
+              alarmPageOffset--;
           }
           else
           {
-            // ПІДТВЕРДЖЕННЯ ВИБОРУ В МЕНЮ
             if (settingsCursor == 0)
             {
               viewingAlarms = true;
             }
             else if (settingsCursor == 1)
             {
+              playMiniGame();
+              lastInputTime = millis();
+              screenNeedsUpdate = true;
+            }
+            else if (settingsCursor == 2)
+            {
               rtcData.glucVibeEnabled = !rtcData.glucVibeEnabled;
               backupDataToFlash();
             }
-            else if (settingsCursor == 2 || settingsCursor == 3)
+            else if (settingsCursor == 3 || settingsCursor == 4)
             {
               struct timeval tv_now;
               gettimeofday(&tv_now, NULL);
               if (rtcData.glucSnoozeUntil > tv_now.tv_sec)
               {
-                rtcData.glucSnoozeUntil = 0; // Скасувати
+                rtcData.glucSnoozeUntil = 0;
               }
               else
               {
-                rtcData.glucSnoozeUntil = tv_now.tv_sec + (settingsCursor == 2 ? 3600 : 28800);
+                rtcData.glucSnoozeUntil = tv_now.tv_sec + (settingsCursor == 3 ? 3600 : 28800);
               }
               backupDataToFlash();
             }
@@ -1237,7 +1415,6 @@ void setup()
         delay(200);
       }
 
-      // 3. НИЖНЯ КНОПКА NEXT: Рух курсора / Збільшення
       if (digitalRead(BUTTON_NEXT_PIN) == LOW)
       {
         if (rtcData.savedScreen == 2)
@@ -1254,13 +1431,12 @@ void setup()
         {
           if (viewingAlarms)
           {
-            alarmPageOffset++; // Гортання списку будильників вниз
+            alarmPageOffset++;
           }
           else
           {
-            // РУХ КУРСОРУ ВНИЗ ПО МЕНЮ
             settingsCursor++;
-            if (settingsCursor > 3)
+            if (settingsCursor > 4)
               settingsCursor = 0;
           }
         }
